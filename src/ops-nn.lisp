@@ -101,6 +101,41 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
                                                        (max 1 (* k n))))))
           res)))))
 
+;;; A fully-connected layer arrives as Gemm rather than MatMul: same product,
+;;; with the transpose and the bias folded into the node.  Written as MatMul plus
+;;; that fold rather than as a second matrix kernel — one kernel is one thing to
+;;; tune and one thing for the conv gate's sibling to check.
+
+(defun transpose-2d (a)
+  (let ((m (aref (tensor-shape a) 0))
+        (n (aref (tensor-shape a) 1)))
+    (tensor-gather-strided a 0 (make-array 2 :element-type 'fixnum
+                                             :initial-contents (list 1 m))
+                           (vector n m))))
+
+(defop "Gemm" (node ins)
+  ;; alpha * A' * B' + beta * C, where ' is an optional transpose and C
+  ;; broadcasts over the result.
+  (destructuring-bind (a b &optional c) ins
+    (let* ((alpha (node-attr node "alpha" 1))
+           (beta (node-attr node "beta" 1))
+           (a (if (eql 1 (node-attr node "transA" 0)) (transpose-2d a) a))
+           (b (if (eql 1 (node-attr node "transB" 0)) (transpose-2d b) b))
+           (res (op-matmul node (list a b)))
+           ;; float32 throughout, because MatMul above is: a Gemm of any other
+           ;; type cannot reach this line
+           (dr (the (simple-array single-float (*)) (tensor-data res)))
+           (al (float alpha 1f0)))
+      (unless (= al 1f0)
+        (dotimes (i (length dr)) (setf (aref dr i) (* al (aref dr i)))))
+      (when c
+        (let ((dc (the (simple-array single-float (*)) (tensor-data c)))
+              (be (float beta 1f0))
+              (sc (broadcast-strides (tensor-shape c) (tensor-shape res))))
+          (do-broadcast ((ic sc) (tensor-shape res))
+            (setf (aref dr i) (+ (aref dr i) (* be (aref dc ic)))))))
+      res)))
+
 ;;; ---- convolution -----------------------------------------------------------
 
 (defun conv1d-attrs (node)

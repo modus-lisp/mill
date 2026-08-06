@@ -23,6 +23,17 @@ list, :tensor is a TENSOR."
   (let ((hit (assoc name (node-attrs node) :test #'string=)))
     (if hit (third hit) default)))
 
+(defstruct (subgraph (:constructor %make-subgraph (nodes outputs initializers)))
+  "A graph nested inside a node's attributes — the two branches of an If.
+
+It declares no inputs, and that is not an omission: an ONNX subgraph of this form
+reads whatever it did not compute itself straight out of the scope that contains
+it, by name.  So there is nothing to bind on the way in, and OUTPUTS is the whole
+of its interface on the way out."
+  (nodes #() :type simple-vector)
+  (outputs '() :type list)
+  (initializers (make-hash-table :test #'equal) :type hash-table))
+
 (defstruct (model (:constructor %make-model))
   (inputs '() :type list)               ; (name dtype shape) — shape may hold strings
   (outputs '() :type list)
@@ -104,14 +115,36 @@ something a build step produced, not something to hand the evaluator."
       (read s))))
 
 (defun decode-attr (attr bytes)
-  "(name kind value) from the graph file, with :tensor values decoded."
+  "(name kind value) from the graph file.  :tensor values become tensors and
+:graph values become subgraphs; the rest — ints, floats, strings — are already
+the Lisp objects the op wants."
   (destructuring-bind (name kind value) attr
     (list name kind
-          (if (eq kind :tensor)
-              (destructuring-bind (tname dt shape offset nbytes) value
-                (declare (ignore tname nbytes))
-                (decode-tensor (parse-dtype dt) (coerce shape 'vector) bytes offset))
-              value))))
+          (case kind
+            (:tensor (destructuring-bind (tname dt shape offset nbytes) value
+                       (declare (ignore tname nbytes))
+                       (decode-tensor (parse-dtype dt) (coerce shape 'vector)
+                                      bytes offset)))
+            (:graph (decode-subgraph value bytes))
+            (t value)))))
+
+(defun decode-node (form bytes)
+  "One (op name inputs outputs attrs) form as a NODE.  Shared with subgraphs,
+which are nodes all the way down."
+  (destructuring-bind (op name inputs outputs attrs) form
+    (%make-node op name (coerce inputs 'simple-vector) (coerce outputs 'simple-vector)
+                (mapcar (lambda (a) (decode-attr a bytes)) attrs))))
+
+(defun decode-subgraph (form bytes)
+  (destructuring-bind (&key initializers nodes outputs) form
+    (let ((inits (make-hash-table :test #'equal)))
+      (loop for (name dt shape offset nbytes) in initializers
+            do (progn nbytes
+                      (setf (gethash name inits)
+                            (decode-tensor (parse-dtype dt) (coerce shape 'vector)
+                                           bytes offset))))
+      (%make-subgraph (map 'simple-vector (lambda (n) (decode-node n bytes)) nodes)
+                      (coerce outputs 'list) inits))))
 
 (defun load-model (graph-path &key bin-path config-path)
   "Load the model exported to GRAPH-PATH (and the .bin beside it)."
@@ -138,13 +171,7 @@ something a build step produced, not something to hand the evaluator."
                           (decode-tensor (parse-dtype dt) (coerce shape 'vector)
                                          bytes offset))))
     (setf (model-nodes m)
-          (map 'simple-vector
-               (lambda (n)
-                 (destructuring-bind (op name inputs outputs attrs) n
-                   (%make-node op name (coerce inputs 'simple-vector)
-                               (coerce outputs 'simple-vector)
-                               (mapcar (lambda (a) (decode-attr a bytes)) attrs))))
-               (getf form :nodes)))
+          (map 'simple-vector (lambda (n) (decode-node n bytes)) (getf form :nodes)))
     (when config-path
       (setf (model-config m) (read-json-file config-path)))
     m))

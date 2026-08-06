@@ -115,7 +115,39 @@ def attr_value(a, blob, node_name):
         arr = numpy_helper.to_array(a.t)
         nm = f"{node_name}::{a.name}"
         return f"({lisp_atom(a.name)} :tensor {tensor_entry(blob, nm, arr)})"
+    if t == onnx.AttributeProto.GRAPH:
+        return f"({lisp_atom(a.name)} :graph {subgraph_entry(a.g, blob, node_name)})"
     raise SystemExit(f"unsupported attribute type {t} on {node_name}.{a.name}")
+
+
+def node_entry(n, i, blob, prefix=""):
+    """One node as (op name inputs outputs attrs), attributes included."""
+    name = prefix + (n.name or f"{n.op_type}_{i}")
+    attrs = " ".join(attr_value(a, blob, name) for a in n.attribute)
+    return (f"({lisp_atom(n.op_type)} {lisp_atom(name)} "
+            f"{lisp_list(list(n.input))} {lisp_list(list(n.output))} ({attrs}))")
+
+
+def subgraph_entry(g, blob, owner):
+    """A nested graph — the branches of an If, and eventually a Loop body.
+
+    A subgraph reads its enclosing scope by name, so it needs no inputs of its
+    own and none are emitted.  Loop and Scan do pass formal inputs, and rather
+    than emit something a reader would have to guess at, this stops."""
+    if len(g.input) > 0:
+        raise SystemExit(f"subgraph {owner}.{g.name} declares inputs "
+                         f"{[i.name for i in g.input]}; only the outer-scope form "
+                         f"(If's branches) is supported")
+    # NOT prefixed, unlike the node names below.  An initializer's name is what
+    # the nodes inside this subgraph read it by, and a subgraph is given a scope
+    # of its own, so there is nothing for a prefix to disambiguate against — it
+    # would only make the binding unreachable.
+    inits = [tensor_entry(blob, i.name, numpy_helper.to_array(i))
+             for i in g.initializer]
+    nodes = [node_entry(n, i, blob, prefix=f"{owner}/") for i, n in enumerate(g.node)]
+    return ("(:initializers (" + " ".join(inits) + ")"
+            " :nodes (" + " ".join(nodes) + ")"
+            " :outputs " + lisp_list([o.name for o in g.output]) + ")")
 
 
 def shape_of(vi):
@@ -138,14 +170,7 @@ def main():
 
     inits = [tensor_entry(blob, i.name, numpy_helper.to_array(i)) for i in g.initializer]
 
-    nodes = []
-    for i, n in enumerate(g.node):
-        name = n.name or f"{n.op_type}_{i}"
-        attrs = " ".join(attr_value(a, blob, name) for a in n.attribute)
-        nodes.append(
-            f"({lisp_atom(n.op_type)} {lisp_atom(name)} "
-            f"{lisp_list(list(n.input))} {lisp_list(list(n.output))} ({attrs}))"
-        )
+    nodes = [node_entry(n, i, blob) for i, n in enumerate(g.node)]
 
     # A value's declared dtype, where the exporter knows it.  The runtime infers
     # dtypes as it goes, but the graph inputs have to come from somewhere.

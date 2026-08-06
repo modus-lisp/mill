@@ -48,6 +48,70 @@ accounts for.  The work list, in the order worth doing it."
                 collect (cons op c))
           #'> :key #'cdr)))
 
+;;; ---- scopes ----------------------------------------------------------------
+;;;
+;;; A flat graph needs no scope at all: every value has a name and the names are
+;;; unique.  A subgraph does, because ONNX nests one graph inside another node's
+;;; attributes and lets the inner one read the outer one's values by name without
+;;; declaring anything — an If's branches are written against whatever is in
+;;; scope where the If sits.  So the runner carries a chain of tables, innermost
+;;; first: a lookup walks outward, and a binding always lands in the innermost,
+;;; which is what makes a branch's intermediates disappear when it finishes.
+
+(defvar *value-env* '()
+  "Scopes, innermost first.  Bound by RUN-MODEL and pushed by RUN-SUBGRAPH.")
+
+(defun env-get (name)
+  "Values: the tensor bound to NAME in the nearest scope that has one, and
+whether any scope did."
+  (dolist (scope *value-env* (values nil nil))
+    (multiple-value-bind (v hit) (gethash name scope)
+      (when hit (return (values v t))))))
+
+(defun apply-node (node i)
+  "Run one node: look its inputs up in the scope chain, call the op, return the
+list of outputs.  I is only ever used to say which node it was."
+  (let ((fn (or (gethash (node-op node) *op-table*)
+                (error 'unimplemented-op :op (node-op node) :node node)))
+        (ins (map 'list
+                  (lambda (name)
+                    (if (string= name "")
+                        nil
+                        (multiple-value-bind (v hit) (env-get name)
+                          (unless hit
+                            (error "node ~a wants ~s, which no node has produced"
+                                   (node-name node) name))
+                          v)))
+                  (node-inputs node))))
+    (handler-case (funcall fn node ins)
+      (unimplemented-op (c) (error c))
+      (error (c)
+        (error "~a (node ~d, ~a ~a): ~a"
+               (type-of c) i (node-op node) (node-name node) c)))))
+
+(defun run-subgraph (sub)
+  "Run SUB in a fresh scope pushed onto the enclosing one, and return the tensors
+its outputs name.  The scope goes away on the way out, and with it everything the
+branch computed but did not return.
+
+None of the lifetime machinery below applies here: a branch is a handful of
+nodes, so its intermediates are left to the collector rather than pooled, and the
+values that matter are the ones it hands back to the node that ran it."
+  (let* ((scope (make-hash-table :test #'equal))
+         (*value-env* (cons scope *value-env*)))
+    (maphash (lambda (k v) (setf (gethash k scope) v)) (subgraph-initializers sub))
+    (loop for node across (subgraph-nodes sub)
+          for i from 0
+          do (loop for name across (node-outputs node)
+                   for o in (apply-node node i)
+                   unless (string= name "") do (setf (gethash name scope) o)))
+    (mapcar (lambda (name)
+              (multiple-value-bind (v hit) (env-get name)
+                (unless hit
+                  (error "subgraph output ~s was never produced" name))
+                v))
+            (subgraph-outputs sub))))
+
 ;;; ---- lifetimes -------------------------------------------------------------
 ;;;
 ;;; A 2755-node graph holds ~110 MB of intermediates if nothing is ever dropped,
@@ -56,13 +120,40 @@ accounts for.  The work list, in the order worth doing it."
 ;;; node that reads it has run.  KEEP names the values to hold on to anyway (the
 ;;; gate keeps everything; synthesis keeps only the audio).
 
+(defun node-subgraph-reads (node)
+  "Value names read by the graphs nested in NODE's attributes.
+
+A branch reads the enclosing scope by name, and those reads belong to the node
+that owns the branch — not to the last ordinary node that happened to mention the
+value.  Without this the runner drops a value at its last plain use and the
+branch, running later, finds nothing there.
+
+The list over-approximates: it includes the names a branch produces and consumes
+entirely within itself, which exist in no outer scope.  That costs a few dead
+entries in a table and nothing else, and the alternative — deciding which names
+escape — is the same question the scope chain already answers at run time.
+
+NIL for every op but If, after one pass over an attribute list."
+  (let ((names '()))
+    (labels ((walk (n)
+               (loop for in across (node-inputs n)
+                     unless (string= in "") do (push in names))
+               (subgraphs n))
+             (subgraphs (n)
+               (loop for (nil kind value) in (node-attrs n)
+                     when (eq kind :graph)
+                       do (map nil #'walk (subgraph-nodes value)))))
+      (subgraphs node))
+    names))
+
 (defun last-use-table (model)
   "Value name -> index of the last node that reads it."
   (let ((last (make-hash-table :test #'equal)))
     (loop for n across (model-nodes model)
           for i from 0
           do (loop for in across (node-inputs n)
-                   unless (string= in "") do (setf (gethash in last) i)))
+                   unless (string= in "") do (setf (gethash in last) i))
+             (dolist (in (node-subgraph-reads n)) (setf (gethash in last) i)))
     last))
 
 ;;; ---- the loop --------------------------------------------------------------
@@ -83,7 +174,9 @@ compares against onnxruntime without the runner knowing anything about fixtures.
          ;; outputs simply never come back down to zero.
          (refs (make-hash-table :test #'eq :size 4096))
          (*tensor-pool* (unless keep-all (make-hash-table :test #'equal)))
-         (*tensor-pool-bytes* 0))
+         (*tensor-pool-bytes* 0)
+         ;; the outermost scope, and the only one until a node runs a subgraph
+         (*value-env* (list vals)))
     (flet ((bind (name tensor)
              (setf (gethash name vals) tensor)
              (when (tensor-p tensor)
@@ -119,23 +212,7 @@ compares against onnxruntime without the runner knowing anything about fixtures.
     (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow :underflow)
       (loop for node across (model-nodes model)
           for i from 0
-          do (let* ((fn (or (gethash (node-op node) *op-table*)
-                            (error 'unimplemented-op :op (node-op node) :node node)))
-                    (ins (map 'list
-                              (lambda (name)
-                                (if (string= name "")
-                                    nil
-                                    (multiple-value-bind (v hit) (gethash name vals)
-                                      (unless hit
-                                        (error "node ~a wants ~s, which no node has produced"
-                                               (node-name node) name))
-                                      v)))
-                              (node-inputs node)))
-                    (outs (handler-case (funcall fn node ins)
-                            (unimplemented-op (c) (error c))
-                            (error (c)
-                              (error "~a (node ~d, ~a ~a): ~a"
-                                     (type-of c) i (node-op node) (node-name node) c)))))
+          do (let ((outs (apply-node node i)))
                (loop for name across (node-outputs node)
                      for o in outs
                      unless (string= name "")
@@ -148,11 +225,15 @@ compares against onnxruntime without the runner knowing anything about fixtures.
                                                (coerce (tensor-shape o) 'list)))))
                (when on-node (funcall on-node i node outs))
                (unless keep-all
-                 ;; drop everything whose last reader was this node
-                 (loop for name across (node-inputs node)
-                       unless (or (string= name "") (gethash name pin))
-                         do (let ((lu (gethash name last)))
-                              (when (and lu (= lu i)) (unbind name)))))))))
+                 ;; drop everything whose last reader was this node, a branch's
+                 ;; reads included — a name a branch invented is not in VALS and
+                 ;; UNBIND passes over it
+                 (flet ((retire (name)
+                          (unless (or (string= name "") (gethash name pin))
+                            (let ((lu (gethash name last)))
+                              (when (and lu (= lu i)) (unbind name))))))
+                   (map nil #'retire (node-inputs node))
+                   (mapc #'retire (node-subgraph-reads node))))))))
     vals))
 
 (defun model-output-tensor (model vals &optional (which 0))

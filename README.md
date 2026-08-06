@@ -18,12 +18,18 @@ MIT licensed.
 
 ## State
 
-**57 ops, and the thing they run is checked against onnxruntime node by node.**
+**61 ops, and the thing they run is checked against onnxruntime node by node.**
 
 mill was extracted from [chord](https://github.com/modus-lisp/chord), which runs
-a Piper VITS voice — 2755 nodes, 50 op types, 15.65M parameters. All 2761 of that
-graph's comparable intermediate values match onnxruntime within
-`1e-4 + 1e-4*|ref|`, and its finished waveform differs by at most 5.3e-5. That
+a Piper VITS voice — 2755 nodes, 50 op types, 15.65M parameters. It is now also
+what [stave](https://github.com/modus-lisp/stave) runs a streaming Zipformer
+transducer on: three graphs, 9444 nodes between them, and every op they use is
+implemented. The transducer's decoder matches onnxruntime on all 20 of its
+values; its encoder is a great deal larger and is being brought up over there,
+not here.
+
+All 2761 of the voice graph's comparable intermediate values match
+onnxruntime within `1e-4 + 1e-4*|ref|`, and its finished waveform differs by at most 5.3e-5. That
 gate is what every optimization below had to survive, and it reports the *same*
 worst error after each one as before it — that invariance is the proof summation
 order survived.
@@ -100,7 +106,36 @@ Two of those are worth more the more threads you have, and for the same reason:
 the strided copy and the pool both removed *serial* work, so they are worth +32%
 and +9% at sixteen threads against +7% and +4% at one.
 
+## Control flow
+
+An ONNX graph is usually straight-line, but not always: where a tracer met a
+branch it could not fold away, it emitted an `If` whose two arms are whole graphs
+sitting in the node's attributes. Those arms declare no inputs. They read
+whatever they did not compute themselves straight out of the scope containing the
+`If`, by name — so the runner carries a chain of scopes, a branch runs with a
+fresh one pushed, and everything it computed but did not return goes away with
+it.
+
+Two things that were invisible on a straight-line graph become bugs the moment
+that exists, and both were real here rather than hypothetical:
+
+*A value's last reader may be inside a branch*, several nodes after the last
+plain node that mentioned it. Count only the plain readers and the runner retires
+the value — hands its buffer to the pool — before the branch that needs it runs.
+That is exactly what happened the first time the zipformer decoder ran.
+
+*A `Constant` hands back one of the model's own attributes*, and an attribute
+outlives the run while the value bound to it is an ordinary intermediate the pool
+may recycle. Return the attribute itself and the first run quietly rewrites the
+model for the second. `Constant` returns a copy.
+
 ## Gates
+
+`inspect/subgraph-gate.lisp` covers both of those, plus `Tile`. It builds graphs
+by hand rather than loading one, because a model only exercises the branch its
+own shapes select — the zipformer decoder's `else` arm is unreachable — and
+because the two hazards need a graph arranged to provoke them. Each check was
+confirmed to fail with its fix removed; a gate that cannot fail is decoration.
 
 `inspect/conv-gate.lisp` covers the convolution kernel: 11342 cases of Conv and
 ConvTranspose against the definition, over strides, dilations, padding and kernel
@@ -117,8 +152,9 @@ The per-node gate is not here, because it needs a model, and mill does not have
 one. It lives with whoever does: see chord's `inspect/node-gate.lisp` for the
 shape of it, and `tools/dump-fixtures.py` below for the half that is generic.
 
-    sbcl --dynamic-space-size 4096 --load inspect/conv-gate.lisp    ; 11342 cases
-    sbcl --dynamic-space-size 4096 --load inspect/gather-gate.lisp  ; 20000 walks
+    sbcl --dynamic-space-size 4096 --load inspect/conv-gate.lisp     ; 11342 cases
+    sbcl --dynamic-space-size 4096 --load inspect/gather-gate.lisp   ; 20000 walks
+    sbcl --load inspect/subgraph-gate.lisp                           ; scopes, lifetimes
 
 ## Layout
 
@@ -132,7 +168,8 @@ shape of it, and `tools/dump-fixtures.py` below for the half that is generic.
     src/ops-math.lisp   elementwise and matmul
     src/ops-reduce.lisp the reductions and the softmaxes
     src/ops-index.lisp  Gather, GatherND, Scatter, TopK, the index ops
-    src/ops-nn.lisp     Conv, ConvTranspose, the normalizations, the activations
+    src/ops-nn.lisp     Conv, ConvTranspose, Gemm, the normalizations, activations
+    src/ops-control.lisp If — the ops that run a graph instead of arithmetic
     src/npy.lisp        read numpy's .npy (system :mill/npy, for gates only)
 
     tools/export-onnx.py    ONNX -> .graph (s-expressions) + .bin (weights)

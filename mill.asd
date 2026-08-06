@@ -22,7 +22,8 @@
                              (:file "ops-math")
                              (:file "ops-reduce")
                              (:file "ops-index")
-                             (:file "ops-nn")))))
+                             (:file "ops-nn")
+                             (:file "ops-control")))))
 
 ;;; A .npy reader, so a gate can compare against values numpy wrote.  Its own
 ;;; system because nothing in the engine needs it — only the things that check

@@ -269,6 +269,47 @@ hundreds of kilobytes."
 
 ;;; ---- filling and padding ---------------------------------------------------
 
+(defop "Constant" (node ins)
+  ;; A node with no inputs that hands back an attribute.  The result is a COPY:
+  ;; the attribute belongs to the model and outlives the run, while the value
+  ;; bound here is an ordinary intermediate the runner may hand to the tensor
+  ;; pool the moment its last reader is done — which would quietly rewrite the
+  ;; constant under a second run of the same model.
+  (let ((tensor (node-attr node "value")))
+    (cond (tensor (copy-tensor tensor))
+          ((node-attr node "value_int")
+           (tensor-from-list :i64 #() (list (node-attr node "value_int"))))
+          ((node-attr node "value_ints")
+           (let ((xs (node-attr node "value_ints")))
+             (tensor-from-list :i64 (vector (length xs)) xs)))
+          ((node-attr node "value_float")
+           (tensor-from-list :f32 #() (list (node-attr node "value_float"))))
+          ((node-attr node "value_floats")
+           (let ((xs (node-attr node "value_floats")))
+             (tensor-from-list :f32 (vector (length xs)) xs)))
+          (t (error "Constant ~a has no value attribute this understands (~{~a~^, ~})"
+                    (node-name node) (mapcar #'first (node-attrs node)))))))
+
+(defop "Tile" (node ins)
+  (destructuring-bind (a repeats) ins
+    (let* ((shape (tensor-shape a))
+           (reps (tensor-integers repeats)))
+      (unless (= (length reps) (length shape))
+        (error "Tile wants one repeat per axis: ~a for shape ~a"
+               reps (coerce shape 'list)))
+      ;; Tiling is a broadcast in disguise, once the axes are split.  Give the
+      ;; input a fresh axis of extent 1 in front of each of its own, stretch
+      ;; those to the repeat counts, and fold each pair back together: output
+      ;; element r*d + k along an axis reads input element k, which is exactly
+      ;; what a repeat means in row-major order.  So this costs one strided copy
+      ;; and no new kernel.
+      (let* ((wide (coerce (loop for d across shape append (list 1 d)) 'vector))
+             (split (coerce (loop for d across shape for r in reps append (list r d))
+                            'vector))
+             (view (reshape-view a wide)))
+        (reshape-view (tensor-gather-strided view 0 (broadcast-strides wide split) split)
+                      (map 'vector #'* shape (coerce reps 'vector)))))))
+
 (defop "ConstantOfShape" (node ins)
   (let* ((value (node-attr node "value"))
          (dtype (if value (tensor-dtype value) :f32))

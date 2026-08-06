@@ -59,6 +59,11 @@ def main():
     so = ort.SessionOptions()
     # optimization would fuse and reorder the very nodes being dumped
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # one thread: a reduction split across N threads is summed in an order that
+    # depends on N, and a fixture that moves with the machine's core count is not
+    # a fixture.  It also quiets onnxruntime's affinity complaints on big hosts.
+    so.intra_op_num_threads = 1
+    so.inter_op_num_threads = 1
     sess = ort.InferenceSession(model.SerializeToString(), so,
                                 providers=["CPUExecutionProvider"])
 
