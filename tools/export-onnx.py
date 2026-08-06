@@ -186,6 +186,15 @@ def main():
         f.write("(:version 1\n")
         f.write(f" :producer {lisp_atom(model.producer_name)}\n")
         f.write(f" :opset {max((o.version for o in model.opset_import), default=0)}\n")
+        # metadata_props is what the trainer wrote down about how to DRIVE the
+        # model, as against how to evaluate it.  A streaming model's chunk
+        # advance and a transducer's context size live nowhere else: the graph
+        # says what one call computes and cannot say how many frames to step
+        # between calls.  Carrying it costs a line, and the alternative is a
+        # table of magic numbers on the Lisp side — a second copy to get wrong.
+        f.write(" :metadata (" +
+                " ".join(f"({lisp_atom(p.key)} {lisp_atom(p.value)})"
+                         for p in model.metadata_props) + ")\n")
         f.write(" :inputs (" + " ".join(io_entry(v) for v in g.input) + ")\n")
         f.write(" :outputs (" + " ".join(io_entry(v) for v in g.output) + ")\n")
         f.write(" :initializers (\n  " + "\n  ".join(inits) + ")\n")

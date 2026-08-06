@@ -40,7 +40,16 @@ of its interface on the way out."
   (initializers (make-hash-table :test #'equal) :type hash-table)  ; name -> tensor
   (nodes #() :type simple-vector)
   (opset 0)
+  (metadata '() :type list)             ; ONNX metadata_props, as (key . value) strings
   (config nil))                         ; the voice's JSON, when one shipped with it
+
+(defun model-meta (model key &optional default)
+  "What the trainer recorded under KEY: how to DRIVE the model, not how to
+evaluate it.  A streaming encoder's decode_chunk_len and a transducer decoder's
+context_size are here and nowhere else in the file — the graph describes one
+call and says nothing about how the calls follow one another.  Values are
+strings; the caller is the one who knows it wanted a number."
+  (or (cdr (assoc key (model-metadata model) :test #'string=)) default))
 
 ;;; ---- decoding the blob -----------------------------------------------------
 ;;;
@@ -160,6 +169,8 @@ which are nodes all the way down."
          (bytes (read-file-bytes bin-path))
          (m (%make-model)))
     (setf (model-opset m) (getf form :opset))
+    (setf (model-metadata m)
+          (loop for (key value) in (getf form :metadata) collect (cons key value)))
     (flet ((io (specs)
              (loop for (name dt shape) in specs
                    collect (list name (parse-dtype dt) (coerce shape 'vector)))))

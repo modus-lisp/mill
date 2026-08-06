@@ -196,6 +196,13 @@ Protobuf parsing lives in Python because it runs once per model, at build time,
 on a workstation — never on the small machine this is aimed at. What ships is a
 text graph a person can read and a blob of little-endian floats.
 
+The export carries the model's `metadata_props` through as well, reachable as
+`(mill:model-meta model "decode_chunk_len")`. That is not decoration. A graph
+describes one call and cannot say how the calls follow one another, so a
+streaming model's chunk advance and a transducer's context size live there and
+nowhere else in the file; the alternative is a table of magic numbers on the
+Lisp side, which is a second copy of the truth to get wrong.
+
 `dump-fixtures.py` takes the model and an `.npz` of feeds, promotes every node
 output to a graph output, and dumps one `.npy` per value plus a manifest. What to
 feed is the caller's business, because it is the one thing the script cannot

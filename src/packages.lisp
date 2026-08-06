@@ -15,7 +15,7 @@
    #:*worker-count* #:*tensor-pool-budget* #:shutdown-workers
    ;; models
    #:model #:load-model #:model-nodes #:model-initializers #:model-inputs #:model-outputs
-   #:model-config #:model-opset
+   #:model-config #:model-opset #:model-metadata #:model-meta
    #:node #:node-op #:node-name #:node-inputs #:node-outputs #:node-attrs #:node-attr
    ;; execution
    #:run-model #:model-output-tensor #:*op-table* #:defop #:op-implemented-p
