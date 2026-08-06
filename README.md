@@ -23,10 +23,9 @@ MIT licensed.
 mill was extracted from [chord](https://github.com/modus-lisp/chord), which runs
 a Piper VITS voice — 2755 nodes, 50 op types, 15.65M parameters. It is now also
 what [stave](https://github.com/modus-lisp/stave) runs a streaming Zipformer
-transducer on: three graphs, 9444 nodes between them, and every op they use is
-implemented. The transducer's decoder matches onnxruntime on all 20 of its
-values; its encoder is a great deal larger and is being brought up over there,
-not here.
+transducer on: three graphs, 9441 nodes between them, and every op they use is
+implemented. All three now match onnxruntime node for node — the encoder on all
+9418 of its values, the decoder on 20, the joiner on 3.
 
 All 2761 of the voice graph's comparable intermediate values match
 onnxruntime within `1e-4 + 1e-4*|ref|`, and its finished waveform differs by at most 5.3e-5. That
@@ -137,23 +136,37 @@ own shapes select — the zipformer decoder's `else` arm is unreachable — and
 because the two hazards need a graph arranged to provoke them. Each check was
 confirmed to fail with its fix removed; a gate that cannot fail is decoration.
 
-`inspect/conv-gate.lisp` covers the convolution kernel: 11342 cases of Conv and
+`inspect/conv-gate.lisp` covers the convolution kernel: 13703 cases of Conv and
 ConvTranspose against the definition, over strides, dilations, padding and kernel
 widths no single model uses, compared **exactly** rather than within a tolerance.
 Every optimization in that kernel claims to leave the summation order alone, so a
-tolerance would hide the only kind of mistake worth catching.
+tolerance would hide the only kind of mistake worth catching. Two-dimensional
+Conv is swept the same way and by the same reference, which is what makes that
+exactness available at all: a 2-D convolution is a sum of 1-D ones, so it reuses
+`conv1d-line` unchanged and accumulates in one order across both ranks.
+
+`inspect/gemm-gate.lisp` covers the transpose-and-bias fold — 1260 cases over
+both transposes, alpha and beta, and every shape C is allowed to broadcast from.
+**Every case is non-square, and that is the whole design of the sweep.** A
+transpose written with the wrong extent is still a transpose when the matrix is
+square: it indexes the same elements in the same order, and every square test
+passes. mill shipped exactly that bug. It survived the zipformer's decoder, whose
+projection is 512x512, and died on its joiner's 500x512 — twenty logits out of
+place, which is a different word. With the bug back in, 770 of the 1260 cases
+fail.
 
 `inspect/gather-gate.lisp` does the same for the strided copy — 20000 random
 walks against the definition, also exactly, since a copy does no arithmetic and
-one differing element is a bug. Both of these need only what is in this
+one differing element is a bug. All of these need only what is in this
 repository.
 
 The per-node gate is not here, because it needs a model, and mill does not have
 one. It lives with whoever does: see chord's `inspect/node-gate.lisp` for the
 shape of it, and `tools/dump-fixtures.py` below for the half that is generic.
 
-    sbcl --dynamic-space-size 4096 --load inspect/conv-gate.lisp     ; 11342 cases
+    sbcl --dynamic-space-size 4096 --load inspect/conv-gate.lisp     ; 13703 cases
     sbcl --dynamic-space-size 4096 --load inspect/gather-gate.lisp   ; 20000 walks
+    sbcl --load inspect/gemm-gate.lisp                               ; 1260 non-square
     sbcl --load inspect/subgraph-gate.lisp                           ; scopes, lifetimes
 
 ## Layout

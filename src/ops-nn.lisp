@@ -107,10 +107,15 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
 ;;; tune and one thing for the conv gate's sibling to check.
 
 (defun transpose-2d (a)
+  ;; Element (i, j) of the result is element (j, i) of A, which sits at j*N + i —
+  ;; so the walk steps by 1 along the result's first axis and by N along its
+  ;; second.  N is the width of A, and it is not M: the two agree only when A is
+  ;; square, which is why the transducer's decoder (a 512x512 projection) was
+  ;; happy with the wrong one and its joiner (500x512) was not.
   (let ((m (aref (tensor-shape a) 0))
         (n (aref (tensor-shape a) 1)))
     (tensor-gather-strided a 0 (make-array 2 :element-type 'fixnum
-                                             :initial-contents (list 1 m))
+                                             :initial-contents (list 1 n))
                            (vector n m))))
 
 (defop "Gemm" (node ins)
@@ -307,6 +312,51 @@ does not apply, and for the padded ends when it does."
                        (- hi lo) stride))))))
   (values))
 
+(declaim (inline conv1d-line))
+(defun conv1d-line (dr dx dw wrow orow xrow kw dilation pad-begin stride len out-len
+                    ilo ihi)
+  "Convolve one input line into one output line: the padded ends one tap at a
+time, the middle all at once.
+
+ILO and IHI bound the run of output taps for which every kernel tap reads a real
+sample, and the caller solves for them because they depend only on the geometry —
+not on which line this is.  An empty run (ILO >= IHI, which is what a strided
+convolution always gets, since the fused loop is a stride-1 walk) means the whole
+line goes the per-tap way.
+
+This is the whole of what the 1-D and 2-D convolutions share: a 2-D kernel row is
+a 1-D kernel applied to one input row, so the tuned loops below serve both and
+there is one summation order between them rather than two."
+  (declare (type (simple-array single-float (*)) dr dx dw)
+           (type dim wrow orow xrow kw dilation stride len out-len ilo ihi)
+           (type (signed-byte 30) pad-begin)
+           (optimize (speed 3) (safety 0)))
+  (cond ((< ilo ihi)
+         (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                      len out-len 0 ilo)
+         ;; the fused window's first source sample is ILO - PAD-BEGIN taps in,
+         ;; which is exactly what ILO was solved for
+         (conv-fused dr dx dw wrow kw dilation (+ orow ilo)
+                     (+ xrow (- ilo pad-begin)) (- ihi ilo))
+         (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                      len out-len ihi out-len))
+        (t
+         (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                      len out-len 0 out-len)))
+  (values))
+
+(declaim (inline fused-window))
+(defun fused-window (out-len len kw dilation pad-begin stride)
+  "Values: the first and last output tap of the run where every kernel tap reads
+a real sample.  It starts once the leftmost tap clears the front padding and ends
+when the rightmost runs off the signal.  Empty unless the stride is 1, which is
+what makes that run a contiguous walk of the input."
+  (if (= stride 1)
+      (let ((lo (min out-len (max 0 pad-begin))))
+        (values lo (max lo (min out-len
+                                (max 0 (+ (- len (* (1- kw) dilation)) pad-begin))))))
+      (values 0 0)))
+
 (defun conv1d-core (dx dw dr row-lo row-hi cin len cout cgroup kw out-len
                     stride dilation pad-begin per-group-out)
   "Accumulate the 1-D convolution of DX by DW into rows [ROW-LO, ROW-HI) of DR,
@@ -316,18 +366,10 @@ which the caller has already filled with the bias (or with zeros)."
                  per-group-out)
            (type (signed-byte 30) pad-begin)
            (optimize (speed 3) (safety 0)))
-  (let* ((xplane (* cin len))           ; elements per batch item, input
-         (oplane (* cout out-len))      ;                          output
-         (wplane (* cgroup kw))         ; elements per output channel, weights
-         ;; the run of output taps for which every kernel tap reads a real
-         ;; sample: it starts once the leftmost tap clears the front padding and
-         ;; ends when the rightmost runs off the signal
-         (fuse (= stride 1))
-         (ilo (if fuse (min out-len (max 0 pad-begin)) 0))
-         (ihi (if fuse
-                  (max ilo (min out-len
-                                (max 0 (+ (- len (* (1- kw) dilation)) pad-begin))))
-                  0)))
+  (multiple-value-bind (ilo ihi) (fused-window out-len len kw dilation pad-begin stride)
+   (let* ((xplane (* cin len))           ; elements per batch item, input
+          (oplane (* cout out-len))      ;                          output
+          (wplane (* cgroup kw)))        ; elements per output channel, weights
     (declare (type dim xplane oplane wplane ilo ihi))
     (loop for row of-type dim from row-lo below row-hi do
       (multiple-value-bind (nb m) (floor row cout)
@@ -343,61 +385,152 @@ which the caller has already filled with the bias (or with zeros)."
                    (xrow (+ xbase (* chan len)))
                    (wrow (+ wbase (* c kw))))
               (declare (type dim chan xrow wrow))
-              (cond
-                ((and fuse (< ilo ihi))
-                 ;; the padded ends one tap at a time, the middle all at once.
-                 ;; At stride 1 the fused window's first source sample is ILO -
-                 ;; PAD-BEGIN taps in, which is exactly where the row starts
-                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
-                              len out-len 0 ilo)
-                 (conv-fused dr dx dw wrow kw dilation (+ orow ilo)
-                             (+ xrow (- ilo pad-begin)) (- ihi ilo))
-                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
-                              len out-len ihi out-len))
-                (t
-                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
-                              len out-len 0 out-len)))))))))
+              (conv1d-line dr dx dw wrow orow xrow kw dilation pad-begin stride
+                           len out-len ilo ihi))))))))
   (values))
+
+;;; A 2-D convolution is a sum of 1-D ones.  Fix a kernel row and it reads a
+;;; single input row with a single row of weights, along the innermost axis,
+;;; which is exactly the loop above — so the whole of the new code is the walk
+;;; that decides WHICH input row each kernel row lands on, and the arithmetic
+;;; stays in the kernels that are already tuned and gated.
+;;;
+;;; An output element accumulates in the order (input channel, kernel row,
+;;; kernel column), the same nesting the 1-D path uses with its middle loop
+;;; absent, and the rows a thread owns are still disjoint — so splitting the
+;;; work does not move a float here either.
+
+(defun conv2d-core (dx dw dr row-lo row-hi cin ih iw cout cgroup kh kw oh ow
+                    stride-h stride-w dil-h dil-w pad-h pad-w per-group-out)
+  "Accumulate the 2-D convolution of DX by DW into rows [ROW-LO, ROW-HI) of DR,
+which the caller has already filled with the bias.  A row is a (batch item,
+output channel) pair, as in the 1-D case; here it holds OH lines of OW."
+  (declare (type (simple-array single-float (*)) dx dw dr)
+           (type dim row-lo row-hi cin ih iw cout cgroup kh kw oh ow
+                 stride-h stride-w dil-h dil-w per-group-out)
+           (type (signed-byte 30) pad-h pad-w)
+           (optimize (speed 3) (safety 0)))
+  (multiple-value-bind (ilo ihi) (fused-window ow iw kw dil-w pad-w stride-w)
+    (let ((xplane (* cin ih iw))         ; elements per batch item, input
+          (oplane (* cout oh ow))        ;                          output
+          (wplane (* cgroup kh kw)))     ; elements per output channel, weights
+      (declare (type dim xplane oplane wplane ilo ihi))
+      (loop for row of-type dim from row-lo below row-hi do
+        (multiple-value-bind (nb m) (floor row cout)
+          (declare (type dim nb m))
+          (let ((xbase (* nb xplane))
+                (obase (+ (* nb oplane) (* m oh ow)))
+                (wbase (* m wplane))
+                (gr (floor m per-group-out)))
+            (declare (type dim xbase obase wbase gr))
+            (dotimes (c cgroup)
+              (declare (type dim c))
+              (let ((xchan (+ xbase (* (+ (* gr cgroup) c) ih iw)))
+                    (wchan (+ wbase (* c kh kw))))
+                (declare (type dim xchan wchan))
+                (dotimes (y oh)
+                  (declare (type dim y))
+                  (let ((orow (+ obase (* y ow))))
+                    (declare (type dim orow))
+                    (dotimes (k kh)
+                      (declare (type dim k))
+                      ;; the input row this kernel row reads; outside the image
+                      ;; it is padding, and padding contributes nothing
+                      (let ((sy (+ (* y stride-h) (* k dil-h) (- pad-h))))
+                        (declare (type fixnum sy))
+                        (when (and (>= sy 0) (< sy ih))
+                          (conv1d-line dr dx dw (+ wchan (* k kw)) orow
+                                       (+ xchan (* sy iw)) kw dil-w pad-w
+                                       stride-w iw ow ilo ihi)))))))))))))
+  (values))
+
+(defun fill-conv-bias (dr db batch cout row-len)
+  "The bias is the initial value of every output tap, so it goes in before the
+accumulation rather than inside it.  ROW-LEN is the taps per (batch, channel)
+row — one line in 1-D, a whole image in 2-D."
+  (declare (type (simple-array single-float (*)) dr db))
+  (dotimes (nb batch)
+    (dotimes (m cout)
+      (let ((orow (* (+ (* nb cout) m) row-len))
+            (b (aref db m)))
+        (dotimes (o row-len) (setf (aref dr (+ orow o)) b))))))
+
+(defun conv1d (node x w bias)
+  (multiple-value-bind (stride dilation pads group) (conv1d-attrs node)
+    (let* ((xs (tensor-shape x)) (ws (tensor-shape w))
+           (batch (aref xs 0)) (cin (aref xs 1)) (len (aref xs 2))
+           (cout (aref ws 0)) (cgroup (aref ws 1)) (kw (aref ws 2))
+           (pad-begin (first pads)) (pad-end (second pads))
+           (out-len (1+ (floor (- (+ len pad-begin pad-end) (* dilation (1- kw)) 1) stride)))
+           (per-group-out (floor cout group))
+           (res (make-tensor :f32 (vector batch cout out-len)))
+           (dx (the (simple-array single-float (*)) (tensor-data x)))
+           (dw (the (simple-array single-float (*)) (tensor-data w)))
+           (dr (the (simple-array single-float (*)) (tensor-data res)))
+           (db (and bias (the (simple-array single-float (*)) (tensor-data bias)))))
+      (declare (type index len out-len kw))
+      (unless (= cin (* cgroup group))
+        (error "Conv: input has ~d channels but the weights want ~d x ~d"
+               cin group cgroup))
+      (when db (fill-conv-bias dr db batch cout out-len))
+      ;; a row costs CGROUP * KW multiply-adds per output tap; hand a thread
+      ;; work worth having, not a row that finishes before it wakes up
+      (parallel-range (* batch cout)
+                      (lambda (lo hi)
+                        (conv1d-core dx dw dr lo hi cin len cout cgroup kw out-len
+                                     stride dilation pad-begin per-group-out))
+                      :min-chunk (max 1 (ceiling +parallel-grain+
+                                                 (max 1 (* cgroup kw out-len)))))
+      res)))
+
+(defun conv2d (node x w bias)
+  (let* ((strides (node-attr node "strides" '(1 1)))
+         (dilations (node-attr node "dilations" '(1 1)))
+         ;; ONNX writes pads as every axis's begin, then every axis's end
+         (pads (node-attr node "pads" '(0 0 0 0)))
+         (group (node-attr node "group" 1))
+         (xs (tensor-shape x)) (ws (tensor-shape w))
+         (batch (aref xs 0)) (cin (aref xs 1)) (ih (aref xs 2)) (iw (aref xs 3))
+         (cout (aref ws 0)) (cgroup (aref ws 1)) (kh (aref ws 2)) (kw (aref ws 3))
+         (stride-h (first strides)) (stride-w (second strides))
+         (dil-h (first dilations)) (dil-w (second dilations))
+         (pad-h (first pads)) (pad-w (second pads))
+         (oh (1+ (floor (- (+ ih pad-h (third pads)) (* dil-h (1- kh)) 1) stride-h)))
+         (ow (1+ (floor (- (+ iw pad-w (fourth pads)) (* dil-w (1- kw)) 1) stride-w)))
+         (per-group-out (floor cout group))
+         (res (make-tensor :f32 (vector batch cout oh ow)))
+         (dx (the (simple-array single-float (*)) (tensor-data x)))
+         (dw (the (simple-array single-float (*)) (tensor-data w)))
+         (dr (the (simple-array single-float (*)) (tensor-data res)))
+         (db (and bias (the (simple-array single-float (*)) (tensor-data bias)))))
+    (declare (type index ih iw oh ow kh kw))
+    (unless (= cin (* cgroup group))
+      (error "Conv: input has ~d channels but the weights want ~d x ~d"
+             cin group cgroup))
+    (when db (fill-conv-bias dr db batch cout (* oh ow)))
+    (parallel-range (* batch cout)
+                    (lambda (lo hi)
+                      (conv2d-core dx dw dr lo hi cin ih iw cout cgroup kh kw oh ow
+                                   stride-h stride-w dil-h dil-w pad-h pad-w
+                                   per-group-out))
+                    :min-chunk (max 1 (ceiling +parallel-grain+
+                                               (max 1 (* cgroup kh kw oh ow)))))
+    res))
 
 (defop "Conv" (node ins)
   (destructuring-bind (x w &optional bias) ins
-    (let ((kernel (node-attr node "kernel_shape")))
-      (unless (= 1 (length kernel))
-        (error "Conv over ~d spatial dimensions is not implemented (this graph is all 1-D)"
-               (length kernel))))
-    (multiple-value-bind (stride dilation pads group) (conv1d-attrs node)
-      (let* ((xs (tensor-shape x)) (ws (tensor-shape w))
-             (batch (aref xs 0)) (cin (aref xs 1)) (len (aref xs 2))
-             (cout (aref ws 0)) (cgroup (aref ws 1)) (kw (aref ws 2))
-             (pad-begin (first pads)) (pad-end (second pads))
-             (out-len (1+ (floor (- (+ len pad-begin pad-end) (* dilation (1- kw)) 1) stride)))
-             (per-group-out (floor cout group))
-             (res (make-tensor :f32 (vector batch cout out-len)))
-             (dx (the (simple-array single-float (*)) (tensor-data x)))
-             (dw (the (simple-array single-float (*)) (tensor-data w)))
-             (dr (the (simple-array single-float (*)) (tensor-data res)))
-             (db (and bias (the (simple-array single-float (*)) (tensor-data bias)))))
-        (declare (type index len out-len kw))
-        (unless (= cin (* cgroup group))
-          (error "Conv: input has ~d channels but the weights want ~d x ~d"
-                 cin group cgroup))
-        ;; the bias is the initial value of every output tap, so it goes in
-        ;; before the accumulation rather than inside it
-        (when db
-          (dotimes (nb batch)
-            (dotimes (m cout)
-              (let ((orow (+ (* nb cout out-len) (* m out-len)))
-                    (b (aref db m)))
-                (dotimes (o out-len) (setf (aref dr (+ orow o)) b))))))
-        ;; a row costs CGROUP * KW multiply-adds per output tap; hand a thread
-        ;; work worth having, not a row that finishes before it wakes up
-        (parallel-range (* batch cout)
-                        (lambda (lo hi)
-                          (conv1d-core dx dw dr lo hi cin len cout cgroup kw out-len
-                                       stride dilation pad-begin per-group-out))
-                        :min-chunk (max 1 (ceiling +parallel-grain+
-                                                   (max 1 (* cgroup kw out-len)))))
-        res))))
+    (let ((auto (node-attr node "auto_pad" "NOTSET"))
+          (rank (- (length (tensor-shape w)) 2)))
+      ;; SAME_UPPER and friends compute the padding from the input shape, and an
+      ;; exporter that knows the shape writes the padding out instead — so this
+      ;; has never been seen, and guessing at it is worse than saying so
+      (unless (equal auto "NOTSET")
+        (error "Conv ~a wants auto_pad ~a, and only explicit pads are implemented"
+               (node-name node) auto))
+      (case rank
+        (1 (conv1d node x w bias))
+        (2 (conv2d node x w bias))
+        (t (error "Conv over ~d spatial dimensions is not implemented" rank))))))
 
 ;;; ConvTranspose's inner loop is CONV-AXPY read backwards: the contiguous walk
 ;;; is over the input and the stride lands on the output, so the multiply cannot

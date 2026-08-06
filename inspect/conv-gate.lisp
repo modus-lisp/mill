@@ -47,6 +47,37 @@
                                               src))))))))
               (setf (aref r (+ (* nb cout out-len) (* m out-len) o)) acc))))))))
 
+(defun ref-conv2d (x w bias batch cin ih iw cout cgroup kh kw oh ow
+                   stride-h stride-w dil-h dil-w pad-h pad-w group)
+  "The definition of a 2-D convolution, one output element at a time.
+
+The taps are summed in the order (input channel, kernel row, kernel column),
+which is the order CONV2D-CORE accumulates in — it walks the kernel rows and
+hands each one to the 1-D line kernel.  Pinning that here is what lets the
+comparison be exact."
+  (let ((r (make-array (* batch cout oh ow) :element-type 'single-float
+                                            :initial-element 0.0))
+        (per-group-out (floor cout group)))
+    (dotimes (nb batch r)
+      (dotimes (m cout)
+        (let ((gr (floor m per-group-out)))
+          (dotimes (y oh)
+            (dotimes (o ow)
+              (let ((acc (if bias (aref bias m) 0.0)))
+                (declare (type single-float acc))
+                (dotimes (c cgroup)
+                  (dotimes (ky kh)
+                    (dotimes (kk kw)
+                      (let ((sy (+ (* y stride-h) (* ky dil-h) (- pad-h)))
+                            (sx (+ (* o stride-w) (* kk dil-w) (- pad-w))))
+                        (when (and (>= sy 0) (< sy ih) (>= sx 0) (< sx iw))
+                          (incf acc (* (aref w (+ (* m cgroup kh kw) (* c kh kw)
+                                                  (* ky kw) kk))
+                                       (aref x (+ (* nb cin ih iw)
+                                                  (* (+ (* gr cgroup) c) ih iw)
+                                                  (* sy iw) sx)))))))))
+                (setf (aref r (+ (* (+ (* nb cout) m) oh ow) (* y ow) o)) acc)))))))))
+
 (defun ref-conv-transpose1d (x w bias batch cin len cout cgroup-in cgroup-out kw
                              out-len stride dilation pad-begin group)
   "A 1-D transposed convolution, one output element at a time.
@@ -143,8 +174,81 @@ count and a description."
           (unless (= (aref got i) (aref want i)) (incf bad)))
         (values bad desc)))))
 
+(defun run-case-2d (batch cin ih iw cout kh kw strides dilations pads group bias-p seed)
+  "One 2-D Conv against the definition.  Same shape of test as RUN-CASE, but the
+attributes come in pairs and PADS is ONNX's order — every axis's begin, then
+every axis's end."
+  (destructuring-bind ((stride-h stride-w) (dil-h dil-w)
+                       (pad-h pad-w pad-h-end pad-w-end)) (list strides dilations pads)
+    (let* ((cgroup (floor cin group))
+           (oh (1+ (floor (- (+ ih pad-h pad-h-end) (* dil-h (1- kh)) 1) stride-h)))
+           (ow (1+ (floor (- (+ iw pad-w pad-w-end) (* dil-w (1- kw)) 1) stride-w)))
+           (desc (format nil "Conv2d cin=~d cout=~d in=~dx~d k=~dx~d s=~a d=~a pads=~a g=~d~:[~; +bias~]"
+                         cin cout ih iw kh kw strides dilations pads group bias-p)))
+      (when (or (< oh 1) (< ow 1)) (return-from run-case-2d (values :skipped desc)))
+      (let* ((xd (filled (* batch cin ih iw) seed))
+             (wd (filled (* cout cgroup kh kw) (+ seed 7919)))
+             (bd (and bias-p (filled cout (+ seed 104729))))
+             (x (make-tensor :f32 (vector batch cin ih iw)))
+             (w (make-tensor :f32 (vector cout cgroup kh kw)))
+             (b (and bias-p (make-tensor :f32 (vector cout))))
+             (node (%make-node "Conv" "t" #() #()
+                               (list (list "kernel_shape" :ints (list kh kw))
+                                     (list "strides" :ints strides)
+                                     (list "dilations" :ints dilations)
+                                     (list "pads" :ints pads)
+                                     (list "group" :int group)))))
+        (replace (tensor-data x) xd)
+        (replace (tensor-data w) wd)
+        (when b (replace (tensor-data b) bd))
+        (let* ((got (tensor-data
+                     (first (sb-int:with-float-traps-masked
+                                (:invalid :divide-by-zero :overflow :underflow)
+                              (funcall (gethash "Conv" *op-table*)
+                                       node (if b (list x w b) (list x w)))))))
+               (want (ref-conv2d xd wd bd batch cin ih iw cout cgroup kh kw oh ow
+                                 stride-h stride-w dil-h dil-w pad-h pad-w group))
+               (bad 0))
+          (unless (= (length got) (length want))
+            (return-from run-case-2d
+              (values (length want) (format nil "~a — LENGTH ~d, expected ~d"
+                                            desc (length got) (length want)))))
+          (dotimes (i (length want))
+            (unless (= (aref got i) (aref want i)) (incf bad)))
+          (values bad desc))))))
+
 (defun main ()
   (let ((cases 0) (skipped 0) (failures '()) (seed 1))
+    ;; 2-D first, since it is the newer kernel.  The sweep is over pairs rather
+    ;; than the full cross product of the two axes: what a 2-D convolution can
+    ;; get wrong that a 1-D one cannot is the row walk — which input row a kernel
+    ;; row lands on, and whether it is inside the image — so the cases that
+    ;; matter are the ones where the two axes DISAGREE.
+    (dolist (kernel '((1 1) (1 3) (3 1) (3 3) (2 5) (7 7)))
+      (dolist (strides '((1 1) (2 2) (1 2) (2 1) (3 2)))
+        (dolist (dilations '((1 1) (2 1) (1 3) (2 2)))
+          (dolist (pads '((0 0 0 0) (1 1 1 1) (0 1 0 1) (3 0 1 2) (5 5 5 5)))
+            (dolist (group '(1 2))
+              (dolist (shape '((1 1) (5 9) (13 4)))
+                (multiple-value-bind (bad desc)
+                    (run-case-2d 2 (* group 3) (first shape) (second shape) (* group 2)
+                                 (first kernel) (second kernel) strides dilations pads
+                                 group (oddp seed) (incf seed 13))
+                  (cond ((eq bad :skipped) (incf skipped))
+                        (t (incf cases)
+                           (when (plusp bad)
+                             (push (format nil "~a — ~d elements differ" desc bad)
+                                   failures)))))))))))
+    ;; and the depthwise case the zipformer's embedding actually uses, where
+    ;; every channel is its own group
+    (dolist (shape '((5 9) (13 4)))
+      (multiple-value-bind (bad desc)
+          (run-case-2d 1 8 (first shape) (second shape) 8 7 7 '(1 1) '(1 1) '(0 3 0 3)
+                       8 t (incf seed 13))
+        (cond ((eq bad :skipped) (incf skipped))
+              (t (incf cases)
+                 (when (plusp bad)
+                   (push (format nil "~a — ~d elements differ" desc bad) failures))))))
     (dolist (op '("Conv" "ConvTranspose"))
       (dolist (kw '(1 2 3 5 7 8 9 11))
         (dolist (stride '(1 2 3 8))
