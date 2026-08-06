@@ -28,12 +28,15 @@ portable way to ask, and guessing high is worse than guessing low."
              1)))
 
 (defparameter *worker-count*
-  (let ((env (sb-ext:posix-getenv "CHORD_THREADS")))
+  (let ((env (or (sb-ext:posix-getenv "MILL_THREADS")
+                 (sb-ext:posix-getenv "CHORD_THREADS"))))
     (or (and env (ignore-errors (parse-integer env)))
         (max 1 (min 16 (detect-cores)))))
-  "Threads to spread a kernel over, counting the calling thread.  CHORD_THREADS
-overrides it; 1 disables the pool entirely.  Changing it after the first
-synthesis needs SHUTDOWN-WORKERS to take effect.
+  "Threads to spread a kernel over, counting the calling thread.  MILL_THREADS
+overrides it, and CHORD_THREADS still does too — this pool was chord's before it
+was mill's, and a knob that has been sitting in someone's shell profile deserves
+to keep working.  1 disables the pool entirely.  Changing it after the first run
+needs SHUTDOWN-WORKERS to take effect.
 
 The cap is where the measured curve flattens, not a guess.  On a 116-core EPYC,
 one sentence synthesized at 0.30x realtime on 1 thread, 1.01x on 8, 1.31x on 16,
