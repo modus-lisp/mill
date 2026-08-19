@@ -86,6 +86,34 @@ memory profile the drop logic exists to avoid.")
   "Bytes the pool may hold on to.  Past this a dead vector is simply dropped —
 the point is to recycle the working set, not to keep the whole graph alive.")
 
+(defvar *const-data*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "The data vectors that never change, as a set.
+
+An op that wants to keep a derived copy of an operand — a transposed one, a
+repacked one — needs to know that the operand will still say the same thing next
+time, and in this engine that is not a property of a tensor.  It is a property of
+the vector underneath, because POOL-TAKE hands the same vector to a new tensor
+with new contents as soon as the old one is dropped.  A pack cached against a
+recycled activation would be right once and wrong afterwards, which is the kind
+of wrong that survives a gate.
+
+So the rule is narrow: a vector is in here because LOAD-MODEL read it out of the
+.bin, or because it is a Constant node's attribute, which is the same thing said
+in the graph instead of the initializer table.  Weak on the key, so the set holds
+nothing alive and a model that is dropped takes its entries with it.")
+
+(defun note-constant (tensor)
+  "Record TENSOR's data vector as never changing.  For initializers and for the
+attributes of Constant nodes, which is all the model owns."
+  (when (and (tensor-p tensor) (tensor-data tensor))
+    (setf (gethash (tensor-data tensor) *const-data*) t))
+  tensor)
+
+(declaim (inline constant-data-p))
+(defun constant-data-p (data)
+  (values (gethash data *const-data*)))
+
 (defun pool-take (dtype n)
   "A free data vector of N elements of DTYPE, or NIL.  Its contents are whatever
 the last owner left; every caller either fills it or assigns every element."
@@ -99,10 +127,18 @@ the last owner left; every caller either fills it or assigns every element."
           (car free))))))
 
 (defun pool-release (dtype data)
-  "Offer DATA back to the pool.  Silently declines once the budget is reached."
+  "Offer DATA back to the pool.  Silently declines once the budget is reached,
+and always declines what the model owns.
+
+The second refusal is what lets a Constant node hand out its attribute instead of
+a copy of it.  The pool is for scratch — vectors the run made and the run is done
+with — and a weight is not scratch: recycling one would hand the next tensor a
+buffer the model is still using to say what that constant is.  Asking here rather
+than at every call site means the guarantee holds in the subgraph runners too,
+which have their own loops and no notion of pinning."
   (let ((tbl *tensor-pool*)
         (n (length data)))
-    (when (and tbl (plusp n))
+    (when (and tbl (plusp n) (not (constant-data-p data)))
       (let ((bytes (* n (dtype-element-bytes dtype))))
         (when (<= (+ *tensor-pool-bytes* bytes) *tensor-pool-budget*)
           (push data (gethash (cons dtype n) tbl))
@@ -253,24 +289,50 @@ Axes that are being stretched get a stride of 0, so the same element is re-read.
 SPECS is any number of (VAR STRIDES) pairs followed by the shape to walk: each
 VAR is the element index of an input read through STRIDES, and I is the linear
 index into the space itself.  Strides of 0 are what make this broadcast — the
-same input element is read for every step along a stretched axis."
+same input element is read for every step along a stretched axis.
+
+The last axis is walked as a straight run rather than through the odometer, and
+that is not a micro-optimization: this macro is under every elementwise op in the
+engine, and the odometer costs several array accesses per element against the two
+or three the body itself does.  Written the obvious way, Where, Log, Equal and Exp
+together were 19% of a transcription, most of it spent counting.  A carry is only
+possible once per run, so hoisting it out of the run is exact — the indices
+visited, and the order, are the same as before.
+
+The run advances each VAR by that input's own last-axis stride, which is 0 for an
+input being stretched along it, and then rewinds so the leading axes carry from
+where the run began."
   (let* ((out-shape (car (last specs)))
          (pairs (butlast specs))
          (vars (mapcar #'first pairs))
          (svars (loop for nil in pairs collect (gensym "STRIDES")))
-         (sh (gensym)) (r (gensym)) (n (gensym)) (idx (gensym)) (k (gensym)))
+         (steps (loop for nil in pairs collect (gensym "STEP")))
+         (sh (gensym)) (r (gensym)) (n (gensym)) (idx (gensym)) (k (gensym))
+         (inner (gensym "INNER")) (outer (gensym "OUTER")) (jj (gensym)))
     `(let* ((,sh ,out-shape)
             (,r (length ,sh))
             (,n (shape-size ,sh))
+            (,inner (if (plusp ,r) (aref ,sh (1- ,r)) 1))
+            (,outer (if (plusp ,inner) (floor ,n ,inner) 0))
             (,idx (make-array (max 1 ,r) :element-type 'fixnum :initial-element 0))
             ,@(loop for s in svars for p in pairs collect `(,s ,(second p)))
-            ,@(loop for v in vars collect `(,v 0)))
-       (declare (type index ,n) (type fixnum ,@vars) (ignorable ,@vars))
-       (dotimes (i ,n)
-         (declare (type index i))
-         ,@body
-         ;; odometer: bump the last axis, carry leftward
-         (loop for ,k from (1- ,r) downto 0
+            ,@(loop for st in steps for s in svars
+                    collect `(,st (if (plusp ,r) (aref ,s (1- ,r)) 0)))
+            ,@(loop for v in vars collect `(,v 0))
+            (i 0))
+       (declare (type index ,n i) (type fixnum ,inner ,outer ,@steps ,@vars)
+                (ignorable i ,@vars))
+       (dotimes (,jj ,outer)
+         (declare (ignorable ,jj))
+         (dotimes (,k ,inner)
+           (declare (ignorable ,k))
+           ,@body
+           (incf i)
+           ,@(loop for v in vars for st in steps collect `(incf ,v ,st)))
+         ;; back to where the run started, so the leading axes carry from there
+         ,@(loop for v in vars for st in steps collect `(decf ,v (* ,inner ,st)))
+         ;; odometer over everything but the last axis, which the run just did
+         (loop for ,k from (- ,r 2) downto 0
                do ,@(loop for v in vars for s in svars
                           collect `(incf ,v (aref ,s ,k)))
                   (incf (aref ,idx ,k))

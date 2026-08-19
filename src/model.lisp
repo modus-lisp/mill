@@ -150,8 +150,9 @@ which are nodes all the way down."
       (loop for (name dt shape offset nbytes) in initializers
             do (progn nbytes
                       (setf (gethash name inits)
-                            (decode-tensor (parse-dtype dt) (coerce shape 'vector)
-                                           bytes offset))))
+                            (note-constant
+                             (decode-tensor (parse-dtype dt) (coerce shape 'vector)
+                                            bytes offset)))))
       (%make-subgraph (map 'simple-vector (lambda (n) (decode-node n bytes)) nodes)
                       (coerce outputs 'list) inits))))
 
@@ -179,8 +180,9 @@ which are nodes all the way down."
     (loop for (name dt shape offset nbytes) in (getf form :initializers)
           do (progn nbytes
                     (setf (gethash name (model-initializers m))
-                          (decode-tensor (parse-dtype dt) (coerce shape 'vector)
-                                         bytes offset))))
+                          (note-constant
+                           (decode-tensor (parse-dtype dt) (coerce shape 'vector)
+                                          bytes offset)))))
     (setf (model-nodes m)
           (map 'simple-vector (lambda (n) (decode-node n bytes)) (getf form :nodes)))
     (when config-path

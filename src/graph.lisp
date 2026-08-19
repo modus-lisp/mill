@@ -212,7 +212,14 @@ compares against onnxruntime without the runner knowing anything about fixtures.
     (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow :underflow)
       (loop for node across (model-nodes model)
           for i from 0
-          do (let ((outs (apply-node node i)))
+          do (let ((outs (if *op-times*
+                             ;; two clock reads, and only when someone asked
+                             (let ((entry (profile-entry-for node))
+                                   (t0 (get-internal-real-time)))
+                               (multiple-value-prog1 (apply-node node i)
+                                 (incf (pe-ticks entry) (- (get-internal-real-time) t0))
+                                 (incf (pe-calls entry))))
+                             (apply-node node i))))
                (loop for name across (node-outputs node)
                      for o in outs
                      unless (string= name "")

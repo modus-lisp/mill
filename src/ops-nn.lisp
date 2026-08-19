@@ -21,46 +21,402 @@
 ;;; HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS, so the arithmetic was a small part of
 ;;; what the arithmetic cost.
 ;;;
-;;; A row here is one (batch item, output row) pair, flattened, which is what the
-;;; worker pool splits on.  The batch offsets are gathered into three vectors up
-;;; front rather than walked with DO-BROADCAST inside the kernel: a broadcast
-;;; walk is an odometer with a carry, which is inherently sequential, and there
-;;; are only a handful of batch items (attention heads) to gather.  Splitting on
-;;; the flattened pair rather than on rows-within-a-matrix matters because this
-;;; graph has both shapes — a few big matrices AND many small ones.
+;;; A row here is one (batch item, output row) pair, flattened.  The batch
+;;; offsets are gathered into three vectors up front rather than walked with
+;;; DO-BROADCAST inside the kernel: a broadcast walk is an odometer with a carry,
+;;; which is inherently sequential, and there are only a handful of batch items
+;;; to gather.
 ;;;
-;;; Rows write disjoint slices of DR and each row's sum is accumulated in the
-;;; same order as before, so the split changes no float result; the node gate is
-;;; what says so.
+;;; The kernel is written around what these graphs actually ask for, which is not
+;;; what "matrix multiply" suggests.  A streaming Zipformer's dominant MatMul is
+;;; (4 1 384) x (384 768): FOUR rows against a matrix a megabyte wide.  Nothing
+;;; about that is compute-bound — every element of B is read, used once, and
+;;; thrown away — and widening the inner loop to AVX2 measured exactly nothing.
+;;;
+;;; That last result was the interesting one, because the reason was not the one
+;;; it looked like.  The loop was not short of lanes and it was not short of
+;;; bandwidth: it was paying an AVX-SSE transition on every pass over K, because
+;;; reading the multiplier out of A with AREF is a legacy SSE instruction and
+;;; everything around it is VEX.  The note in simd.lisp has the measurement —
+;;; ~115 ns per transition, which is 46 us of a 243 us call here, and which
+;;; becomes 90% of the run in any kernel that reads a scalar more than once per
+;;; pass.  That is also why the obvious rewrite, accumulating in registers with K
+;;; on the inside, came out FIFTY TIMES slower the first time it was tried, and
+;;; why this file used to blame the column-major walk over B.  It was not the
+;;; walk.  With the multiplier loaded by F32V-BROADCAST-REF the same rewrite is
+;;; three times faster than the loop it replaces, and the stride over B — the
+;;; thing that supposedly cost fifty times — measures the same as reading B
+;;; straight through.
+;;;
+;;; So: a block of +MM-ROWS+ output rows by +MM-LANES+ lane groups of columns is
+;;; held in vector registers while K runs on the inside, and B is read once per
+;;; block.  Twelve accumulators, three B values and one multiplier is sixteen
+;;; registers, which is what AVX2 has; 4x4 spills and measured twice as slow as
+;;; 4x3, and 4x1 half as fast.
+;;;
+;;; The stride over B was innocent of the fifty times, but it is not innocent.
+;;; It only shows up at the working set the model actually has: this encoder is
+;;; 250 MB of weights and every one of them is read once per 0.16 s of audio, so
+;;; nothing is ever warm.  A block walk reads twenty-four floats and jumps a row,
+;;; and measured against a straight read of the same 203 MB that is 7.98 GB/s
+;;; against 21.29 on one core and 20.60 against 30.41 on the pool.  At a
+;;; megabyte, where the earlier measurements were taken, the two are the same
+;;; speed and this whole paragraph is invisible.
+;;;
+;;; The fix is the one every BLAS makes: permute B once into the order the kernel
+;;; visits it — column block outer, K inner, lanes contiguous — so the walk is a
+;;; straight read.  It is worth doing here for a reason a BLAS does not have,
+;;; which is that these B's are weights.  The same matrix is multiplied by a new
+;;; row of audio sixty-four times a second for the length of the recording, so
+;;; the permutation is paid once and read thousands of times.  MM-PACKED-B is
+;;; what decides, and what it asks is whether B is a weight — CONSTANT-DATA-P,
+;;; which LOAD-MODEL sets on the initializers and nothing else sets.  It is
+;;; tempting to ask instead whether this B has been seen before, and that is
+;;; wrong in exactly the case that matters: graph.lisp pools activation buffers,
+;;; so the same data vector comes back holding somebody else's numbers, and a
+;;; pack cached against it would be right the first time and silently stale
+;;; after.  On the dominant shape at 203 MB that is 240 us a call against 47,
+;;; and the answers are bit-identical because a permutation is not arithmetic.
+;;;
+;;; The zero skip is the one thing that loop cannot do, because testing for zero
+;;; is a scalar compare and a scalar compare is the same 115 ns — measured, one
+;;; ZEROP per row per pass cost more than every multiply in the block put
+;;; together.  So the test moves out of the loop: each group of rows is scanned
+;;; once before the vector work, and a group with a zero anywhere in it runs the
+;;; older K-outside kernel, which skips per row and pays the transition once per
+;;; pass rather than four times.  On this model that is 16% of MatMul calls and
+;;; 3% of the multiplies, and 4.6% of the seconds MatMul spends.
+;;;
+;;; That kernel reads B where it lies, not the pack, which is the one place this
+;;; file knowingly leaves the bad walk in — it is a few percent of a few percent,
+;;; and the packed layout puts a group's K contiguously, so if it ever matters
+;;; the fix is a read address and not an argument.
+;;;
+;;; Splitting for threads follows the shape rather than the tradition.  Rows are
+;;; the natural unit and there are FOUR of them here, so a 16-thread pool over
+;;; rows is a 4-thread pool; when rows are scarce the split is over columns
+;;; instead, which are disjoint, plentiful, and give each thread its own block.
+;;;
+;;; Every output element is still a sum over K in increasing K order, with the
+;;; same zero skip, so no float result moves: the node gate and the two element
+;;; gates are what say so, and they are exact comparisons.
 
-(defun matmul-core (da db dr ias ibs ios m k n row-lo row-hi)
-  "Accumulate rows [ROW-LO, ROW-HI) of a batch of matrix products into DR, which
-the caller has left zeroed.  IAS/IBS/IOS are the per-batch-item element offsets
-into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
-  (declare (type (simple-array single-float (*)) da db dr)
-           (type (simple-array fixnum (*)) ias ibs ios)
-           (type dim m k n row-lo row-hi)
+(defconstant +mm-rows+ 4
+  "Output rows computed together off one pass over B.  Each costs an accumulator
+register per lane group and saves a re-read of B; four is where the accumulators
+still fit alongside the operands, and it is exactly the row count of this
+model's largest MatMul.")
+
+(defconstant +mm-lanes+ 3
+  "Lane groups of columns held in registers at once.  R rows by C lane groups
+costs R*C accumulators plus C values of B plus one multiplier, and sixteen is
+all there is: 4x3 measured 75 us on the dominant shape, 4x2 84, 4x1 108, and 4x4
+164 because it spills.")
+
+(defconstant +mm-cols+ (* +mm-lanes+ +f32-lanes+)
+  "Columns in a wide block, and the alignment of every column window a caller
+hands the kernel.  A thread that started at a lane boundary instead of a block
+boundary would visit the blocks the packed B does not have.")
+
+(defparameter *mm-pack-floor* 65536
+  "Elements of B below which packing is not worth it.  A quarter of a megabyte
+still fits in L2, and a walk that stays in L2 is not paying for its stride —
+measured, at a megabyte the blocked and straight reads run at the same speed and
+the pack is a copy for nothing.  Set this above any weight in the model to turn
+packing off; it costs a second copy of every matrix it applies to.")
+
+(defvar *mm-packs*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "B's data vector to its packed copy.
+
+Weak on the key, so a packed copy lives exactly as long as the weights it holds —
+a model that is dropped drops its packs with it.  Keyed on the data vector rather
+than the tensor because a reshape shares the data and wants the same pack.")
+
+(defun mm-pack (db k n)
+  "DB permuted into the order %MM-FAST reads it: wide blocks of +MM-COLS+
+columns, then single lane groups, then the columns that are not a lane, each run
+holding all of K contiguously.
+
+Every column occupies exactly K floats and the groups are in increasing column
+order, so the run for a group starting at column COL begins at COL*K — which is
+why the kernel needs no table to find it."
+  (declare (type (simple-array single-float (*)) db) (type dim k n)
            (optimize (speed 3) (safety 0)))
-  (loop for row of-type dim from row-lo below row-hi do
-    (multiple-value-bind (item r) (floor row m)
-      (declare (type dim item r))
-      (let ((arow (the dim (+ (aref ias item) (* r k))))
-            (orow (the dim (+ (aref ios item) (* r n))))
-            (bbase (the dim (aref ibs item))))
-        ;; k on the outside, n contiguous on the inside: one row of B is
-        ;; streamed per accumulation step instead of strided over.  The
-        ;; zero test is on the k loop, not the n loop, so it costs one branch
-        ;; per N multiply-adds — and this graph's attention matrices are full
-        ;; of exact zeros from masking.
+  (let ((p (make-array (* k n) :element-type 'single-float))
+        (o 0) (col 0))
+    (declare (type dim o col))
+    (flet ((group (w)
+             (declare (type dim w))
+             (dotimes (kk k)
+               (let ((brow (the dim (+ (the dim (* kk n)) col))))
+                 (dotimes (j w)
+                   (setf (aref p o) (aref db (the dim (+ brow j))))
+                   (incf o))))
+             (incf col w)))
+      (loop while (<= (+ col +mm-cols+) n) do (group +mm-cols+))
+      (loop while (<= (+ col +f32-lanes+) n) do (group +f32-lanes+))
+      (loop while (< col n) do (group 1)))
+    p))
+
+(defun mm-packed-b (db k n)
+  "The packed copy of DB, building it the first time, or NIL to say the kernel
+should read B where it lies.
+
+Only a weight is packed, and CONSTANT-DATA-P is the only thing that says so —
+not a use count, which would be wrong for exactly the case that matters: an
+activation's vector goes back to the pool and comes out again holding something
+else, so a copy kept against it is right until it silently is not.  A weight, by
+contrast, comes round once per audio frame for the length of the recording and
+pays for the permutation on the second call.
+
+Only a whole single matrix qualifies: a batch of them shares one data vector and
+would need a pack each."
+  (declare (type (simple-array single-float (*)) db) (type dim k n))
+  (when (and (= (length db) (* k n))
+             (>= (* k n) *mm-pack-floor*)
+             (constant-data-p db))
+    (or (gethash db *mm-packs*)
+        (setf (gethash db *mm-packs*) (mm-pack db k n)))))
+
+(declaim (inline mm-dense-p))
+(defun mm-dense-p (da arows rr k)
+  "Is every one of the RR rows' K multipliers nonzero?
+
+Asked once per group, outside the vector loop, because asking inside it is a
+scalar compare and a scalar compare costs a transition — see simd.lisp.  A NO
+sends the group to %MM-SPARSE, which is slower and does the skip properly."
+  (declare (type (simple-array single-float (*)) da)
+           (type (simple-array fixnum (*)) arows)
+           (type dim rr k) (optimize (speed 3) (safety 0)))
+  (dotimes (i rr t)
+    (let ((base (aref arows i)))
+      (declare (type dim base))
+      (dotimes (kk k)
+        (when (zerop (aref da (the dim (+ base kk))))
+          (return-from mm-dense-p nil))))))
+
+(defmacro %mm-block (r c packed)
+  "Column blocks of C lane groups for R rows, accumulating in registers.
+
+K is on the inside and the accumulators never touch memory until the block is
+finished, so B is read once per block and the output once per block.  Advances
+COL to the first column it did not cover, so the caller can follow this with a
+narrower block and then the scalar remainder.
+
+PACKED says which B this is reading.  The two differ in one expression: where a
+row of the block sits.  In the graph's own layout that is BBASE + KK*N + COL, a
+jump of a whole row of B per pass; in the packed one it is COL*K + KK*C*LANES,
+which is the next thing in memory.
+
+Free in the expansion: DA, DB, DP, DR, BBASE, K, N, COL, COL-HI and the
+AROWi/OROWi the caller bound."
+  (let ((accs (loop for i below r
+                    collect (loop for j below c
+                                  collect (intern (format nil "ACC~d~d" i j)))))
+        (bs (loop for j below c collect (intern (format nil "BV~d" j))))
+        (as (loop for i below r collect (intern (format nil "AROW~d" i))))
+        (os (loop for i below r collect (intern (format nil "OROW~d" i)))))
+    `(loop while (<= (+ col (* ,c +f32-lanes+)) col-hi) do
+      (let ((bb (the dim ,(if packed `(* col k) `(+ bbase col))))
+            ,@(loop for row in accs append
+                    (loop for a in row collect `(,a (f32v-broadcast 0.0)))))
+        (declare (type dim bb) (type f32v-pack ,@(reduce #'append accs)))
         (dotimes (kk k)
           (declare (type dim kk))
-          (let ((x (aref da (the dim (+ arow kk))))
-                (brow (the dim (+ bbase (* kk n)))))
-            (unless (zerop x)
-              (dotimes (col n)
-                (declare (type dim col))
-                (incf (aref dr (the dim (+ orow col)))
-                      (* x (aref db (the dim (+ brow col))))))))))))
+          (let* ((brow (the dim (+ bb (the dim (* kk ,(if packed `(* ,c +f32-lanes+) 'n))))))
+                 ,@(loop for b in bs for j from 0
+                         collect `(,b (f32v-ref ,(if packed 'dp 'db)
+                                                (the dim (+ brow (* ,j +f32-lanes+)))))))
+            (declare (type f32v-pack ,@bs))
+            ,@(loop for i below r
+                    collect `(let ((xv (f32v-broadcast-ref da (the dim (+ ,(nth i as) kk)))))
+                               (declare (type f32v-pack xv))
+                               (setf ,@(loop for j below c
+                                             append `(,(nth j (nth i accs))
+                                                      (f32v+ ,(nth j (nth i accs))
+                                                             (f32v* xv ,(nth j bs))))))))))
+        ;; the window is written, not added to: the caller left DR zeroed and no
+        ;; other block touches these columns, so storing the register is the same
+        ;; sum in the same order
+        (setf ,@(loop for i below r
+                      append (loop for j below c
+                                   append `((f32v-ref dr (the dim (+ ,(nth i os) col
+                                                                     (* ,j +f32-lanes+))))
+                                            ,(nth j (nth i accs))))))
+        (incf col (* ,c +f32-lanes+))))))
+
+(defmacro %mm-fast (r packed)
+  "R rows over [COL, COL-HI) with no multiplier equal to zero.
+
+Wide blocks first, then one lane group at a time, then the columns that are not
+a lane at all — which is also the order MM-PACK lays a packed B out in, so
+PACKED changes where B is read and nothing else.  COL-LO is a multiple of
++MM-COLS+ for the same reason: a window that started anywhere else would ask for
+blocks the packed B was not cut into.
+
+The fence goes between the vector work and the remainder and nowhere else: the
+remainder is scalar code, and so is whatever called this.
+
+Free in the expansion, from the enclosing kernel: AROWS, OROWS, BBASE, DA, DB,
+DP, DR, K, N, COL-LO and COL-HI."
+  (let ((as (loop for i below r collect (intern (format nil "AROW~d" i))))
+        (os (loop for i below r collect (intern (format nil "OROW~d" i)))))
+    `(let ((col col-lo)
+           ,@(loop for a in as for i from 0 collect `(,a (aref arows ,i)))
+           ,@(loop for o in os for i from 0 collect `(,o (aref orows ,i))))
+       (declare (type dim col ,@as ,@os))
+       (%mm-block ,r ,+mm-lanes+ ,packed)
+       (%mm-block ,r 1 ,packed)
+       (f32v-done)
+       ,(let ((sums (loop for i below r collect (intern (format nil "SUM~d" i)))))
+          `(loop while (< col col-hi) do
+            (let ,(loop for s in sums collect `(,s 0.0))
+              (declare (type single-float ,@sums))
+              (dotimes (kk k)
+                (declare (type dim kk))
+                (let ((bv ,(if packed
+                               `(aref dp (the dim (+ (the dim (* col k)) kk)))
+                               `(aref db (the dim (+ bbase (the dim (* kk n)) col))))))
+                  ,@(loop for i below r
+                          collect `(incf ,(nth i sums)
+                                         (* (aref da (the dim (+ ,(nth i as) kk))) bv)))))
+              (setf ,@(loop for i below r
+                            append `((aref dr (the dim (+ ,(nth i os) col))) ,(nth i sums))))
+              (incf col)))))))
+
+(defmacro %mm-sparse (r)
+  "The kernel for R rows where some multiplier is exactly zero.
+
+A row whose multiplier is zero is skipped rather than multiplied: 0.0 times an
+infinity is a NaN where the skip leaves a finite sum, and the gates compare
+exactly.  That means a test per row per pass, and a test is a scalar compare, so
+this loop keeps K on the outside where all R of them can be read and tested
+together — one transition per pass instead of R.  It is three times slower than
+%MM-FAST and it runs on 3% of the multiplies.
+
+Free in the expansion, from the enclosing kernel: AROWS, OROWS, BBASE, DA, DB,
+DR, K, N, COL-LO, COL-HI and CV-HI."
+  (let ((xs (loop for i below r collect (intern (format nil "X~d" i))))
+        (as (loop for i below r collect (intern (format nil "AROW~d" i))))
+        (os (loop for i below r collect (intern (format nil "OROW~d" i)))))
+    (labels ((pass (which)
+               ;; the column loop for the rows in WHICH, as a list of indices
+               `(do ((col col-lo (+ col +f32-lanes+))) ((>= col cv-hi))
+                  (declare (type dim col))
+                  (let ((bv (f32v-ref db (the dim (+ brow col)))))
+                    ,@(loop for i in which
+                            collect `(setf (f32v-ref dr (the dim (+ ,(nth i os) col)))
+                                           (f32v+ (f32v-ref dr (the dim (+ ,(nth i os) col)))
+                                                  (f32v* ,(intern (format nil "XV~d" i))
+                                                         bv)))))))
+             (tail (i)
+               `(loop for col of-type dim from cv-hi below col-hi
+                      do (incf (aref dr (the dim (+ ,(nth i os) col)))
+                               (* ,(nth i xs) (aref db (the dim (+ brow col))))))))
+      `(let ,(append (loop for a in as for i from 0 collect `(,a (aref arows ,i)))
+                     (loop for o in os for i from 0 collect `(,o (aref orows ,i))))
+         (declare (type dim ,@as ,@os))
+         ;; the whole lanes, all of K.  The fence is out here and not inside the
+         ;; K loop: at K=512 one VZEROUPPER per row of B costs more than the
+         ;; multiplies do.  Splitting the columns this way is safe for the same
+         ;; reason the thread split is — an output element still sums over K in
+         ;; K order, whichever pass writes it.
+         (dotimes (kk k)
+           (declare (type dim kk))
+           (let ((brow (the dim (+ bbase (* kk n))))
+                 ,@(loop for x in xs for a in as
+                         collect `(,x (aref da (the dim (+ ,a kk))))))
+             (declare (type dim brow) (type single-float ,@xs))
+             (if (and ,@(loop for x in xs collect `(not (zerop ,x))))
+                 ;; every row wants this row of B: read it once, fan it out
+                 (let ,(loop for x in xs for i from 0
+                             collect `(,(intern (format nil "XV~d" i)) (f32v-broadcast ,x)))
+                   (declare (type f32v-pack ,@(loop for i below r
+                                                    collect (intern (format nil "XV~d" i)))))
+                   ,(pass (loop for i below r collect i)))
+                 ;; someone's multiplier is exactly zero, so their row is left
+                 ;; alone rather than added to
+                 (progn
+                   ,@(loop for i below r
+                           collect `(unless (zerop ,(nth i xs))
+                                      (let ((,(intern (format nil "XV~d" i))
+                                              (f32v-broadcast ,(nth i xs))))
+                                        (declare (type f32v-pack
+                                                       ,(intern (format nil "XV~d" i))))
+                                        ,(pass (list i)))))))))
+         (f32v-done)
+         ;; and the columns that are not a whole lane, at width one
+         (when (< cv-hi col-hi)
+           (dotimes (kk k)
+             (declare (type dim kk))
+             (let ((brow (the dim (+ bbase (* kk n))))
+                   ,@(loop for x in xs for a in as
+                           collect `(,x (aref da (the dim (+ ,a kk))))))
+               (declare (type dim brow) (type single-float ,@xs))
+               ,@(loop for i below r
+                       collect `(unless (zerop ,(nth i xs)) ,(tail i))))))))))
+
+(defun matmul-core (da db dp dr ias ibs ios m k n row-lo row-hi col-lo col-hi)
+  "Accumulate rows [ROW-LO, ROW-HI) by columns [COL-LO, COL-HI) of a batch of
+matrix products into DR, which the caller has left zeroed.  IAS/IBS/IOS are the
+per-batch-item element offsets into DA/DB/DR; row R belongs to batch item
+(FLOOR R M).
+
+DP is MM-PACKED-B's copy of B or NIL, and COL-LO must be a multiple of +MM-COLS+
+when it is not NIL.  It is only ever produced for a single unbatched matrix, so
+BBASE is zero wherever it is used.
+
+Two calls may not overlap in the window they name, which is what makes both of
+the caller's splits — by row and by column — safe."
+  (declare (type (simple-array single-float (*)) da db dr)
+           (type (or null (simple-array single-float (*))) dp)
+           (type (simple-array fixnum (*)) ias ibs ios)
+           (type dim m k n row-lo row-hi col-lo col-hi)
+           (optimize (speed 3) (safety 0)))
+  (let* ((width (the dim (- col-hi col-lo)))
+         (cv-hi (the dim (+ col-lo (- width (mod width +f32-lanes+)))))
+         (arows (make-array +mm-rows+ :element-type 'fixnum))
+         (orows (make-array +mm-rows+ :element-type 'fixnum))
+         (bbase 0)
+         (row row-lo))
+    (declare (dynamic-extent arows orows) (type dim bbase row))
+    (loop while (< row row-hi) do
+      ;; how many of the next rows share a B — all of them when B is broadcast
+      ;; over the batch (the usual case) or when they are rows of one matrix,
+      ;; and one at a time when neither holds
+      (let ((rr 1))
+        (declare (type dim rr))
+        (multiple-value-bind (item r) (floor row m)
+          (setf bbase (aref ibs item)
+                (aref arows 0) (+ (aref ias item) (* r k))
+                (aref orows 0) (+ (aref ios item) (* r n))))
+        (loop for i of-type dim from 1 below (min +mm-rows+ (- row-hi row))
+              do (multiple-value-bind (item r) (floor (+ row i) m)
+                   (unless (= (aref ibs item) bbase) (return))
+                   (setf (aref arows i) (+ (aref ias item) (* r k))
+                         (aref orows i) (+ (aref ios item) (* r n)))
+                   (incf rr)))
+        (if (mm-dense-p da arows rr k)
+            (if dp
+                (let ((dp dp))
+                  (declare (type (simple-array single-float (*)) dp))
+                  (ecase rr
+                    (1 (%mm-fast 1 t))
+                    (2 (%mm-fast 2 t))
+                    (3 (%mm-fast 3 t))
+                    (4 (%mm-fast 4 t))))
+                (ecase rr
+                  (1 (%mm-fast 1 nil))
+                  (2 (%mm-fast 2 nil))
+                  (3 (%mm-fast 3 nil))
+                  (4 (%mm-fast 4 nil))))
+            (ecase rr
+              (1 (%mm-sparse 1))
+              (2 (%mm-sparse 2))
+              (3 (%mm-sparse 3))
+              (4 (%mm-sparse 4))))
+        (incf row rr))))
   (values))
 
 (defop "MatMul" (node ins)
@@ -85,6 +441,7 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
                (res (make-tensor (tensor-dtype a) out-shape))
                (da (the (simple-array single-float (*)) (tensor-data a)))
                (db (the (simple-array single-float (*)) (tensor-data b)))
+               (dp (mm-packed-b db k n))
                (dr (the (simple-array single-float (*)) (tensor-data res))))
           (declare (type dim m k n))
           (let* ((nb (max 1 (shape-size batch)))
@@ -93,12 +450,30 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
                  (ios (make-array nb :element-type 'fixnum :initial-element 0)))
             (do-broadcast ((ia sa) (ib sb) (io so) batch)
               (setf (aref ias i) ia (aref ibs i) ib (aref ios i) io))
-            ;; a row costs K * N multiply-adds; hand a thread work worth having
-            (parallel-range (* nb m)
-                            (lambda (lo hi)
-                              (matmul-core da db dr ias ibs ios m k n lo hi))
-                            :min-chunk (max 1 (ceiling +parallel-grain+
-                                                       (max 1 (* k n))))))
+            ;; Rows first when there are enough of them to go round, because
+            ;; splitting rows keeps each thread's B whole.  Otherwise columns:
+            ;; this model's big products have four rows and a thousand columns,
+            ;; and a four-way split of a sixteen-thread pool is the difference
+            ;; between the kernel being fast and the op being fast.
+            (let ((nrows (* nb m)))
+              (declare (type dim nrows))
+              (if (>= nrows (* 2 *worker-count*))
+                  (parallel-range nrows
+                                  (lambda (lo hi)
+                                    (matmul-core da db dp dr ias ibs ios m k n lo hi 0 n))
+                                  :min-chunk (max 1 (ceiling +parallel-grain+
+                                                             (max 1 (* k n)))))
+                  ;; a whole block per chunk, so no thread owns half a vector or
+                  ;; starts in the middle of one of the packed B's blocks
+                  (let ((tiles (ceiling n +mm-cols+)))
+                    (parallel-range tiles
+                                    (lambda (lo hi)
+                                      (matmul-core da db dp dr ias ibs ios m k n 0 nrows
+                                                   (* lo +mm-cols+)
+                                                   (min n (* hi +mm-cols+))))
+                                    :min-chunk (max 1 (ceiling +parallel-grain+
+                                                               (max 1 (* nrows k
+                                                                         +mm-cols+)))))))))
           res)))))
 
 ;;; A fully-connected layer arrives as Gemm rather than MatMul: same product,
@@ -118,14 +493,39 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
                                              :initial-contents (list 1 n))
                            (vector n m))))
 
+(defvar *gemm-transposes*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "A weight's data vector to the transposed tensor Gemm needs of it.")
+
+(defun transposed-operand (a)
+  "TRANSPOSE-2D of A, kept if A is a weight.
+
+transB is how a fully-connected layer arrives, so the matrix being transposed is
+almost always the layer's weights, and transposing them again for every frame of
+audio costs twice: once for the copy, and once more because a fresh tensor every
+call is a data vector MM-PACKED-B has never seen and will never pack.  The
+joiner's 500x512 projection was 8.4% of this model's run on those two counts
+alone.
+
+Keyed on the vector, so the shape is checked rather than assumed: a reshape of a
+weight shares its data and wants a different transpose."
+  (let* ((d (tensor-data a))
+         (want (vector (aref (tensor-shape a) 1) (aref (tensor-shape a) 0))))
+    (if (constant-data-p d)
+        (let ((hit (gethash d *gemm-transposes*)))
+          (if (and hit (equalp (tensor-shape hit) want))
+              hit
+              (setf (gethash d *gemm-transposes*) (note-constant (transpose-2d a)))))
+        (transpose-2d a))))
+
 (defop "Gemm" (node ins)
   ;; alpha * A' * B' + beta * C, where ' is an optional transpose and C
   ;; broadcasts over the result.
   (destructuring-bind (a b &optional c) ins
     (let* ((alpha (node-attr node "alpha" 1))
            (beta (node-attr node "beta" 1))
-           (a (if (eql 1 (node-attr node "transA" 0)) (transpose-2d a) a))
-           (b (if (eql 1 (node-attr node "transB" 0)) (transpose-2d b) b))
+           (a (if (eql 1 (node-attr node "transA" 0)) (transposed-operand a) a))
+           (b (if (eql 1 (node-attr node "transB" 0)) (transposed-operand b) b))
            (res (op-matmul node (list a b)))
            ;; float32 throughout, because MatMul above is: a Gemm of any other
            ;; type cannot reach this line
