@@ -156,13 +156,15 @@ what makes this forward-compatible with ONNX versions this predates."
 
 (defun %read-attr (b)
   "AttributeProto -> (name key value), matching what the .graph reader produces."
-  (let ((name "") (type nil) (i nil) (f nil) (s nil) (ints '()) (floats '()) (strings '()) (tens nil))
+  (let ((name "") (type nil) (i nil) (f nil) (s nil) (ints '()) (floats '()) (strings '())
+        (tens nil) (sub nil))
     (do-fields (fl w b)
       (1 (setf name (pb-string b)))
       (2 (setf f (%bits->f32 (pb-fixed b 4))))
       (3 (setf i (pb-signed (pb-varint b))))
       (4 (setf s (pb-string b)))
       (5 (setf tens (nth-value 1 (%read-tensor (pb-sub b)))))
+      (6 (setf sub (%read-subgraph (pb-sub b))))       ; an If's branch
       (7 (if (= w 2)
              (let ((sub (pb-sub b)))
                (loop while (< (pb-pos sub) (pb-end sub)) do (push (%bits->f32 (pb-fixed sub 4)) floats)))
@@ -176,17 +178,30 @@ what makes this forward-compatible with ONNX versions this predates."
     ;; AttributeType: 1 FLOAT 2 INT 3 STRING 4 TENSOR 6 FLOATS 7 INTS 8 STRINGS
     (list name
           (case type
-            (1 :float) (2 :int) (3 :string) (4 :tensor)
+            (1 :float) (2 :int) (3 :string) (4 :tensor) (5 :graph)
             (6 :floats) (7 :ints) (8 :strings)
-            (t (cond (f :float) (i :int) (s :string) (tens :tensor)
+            (t (cond (f :float) (i :int) (s :string) (tens :tensor) (sub :graph)
                      (floats :floats) (ints :ints) (strings :strings) (t :int))))
           (case type
-            (1 (float (or f 0) 1d0)) (2 (or i 0)) (3 (or s "")) (4 tens)
+            (1 (float (or f 0) 1d0)) (2 (or i 0)) (3 (or s "")) (4 tens) (5 sub)
             (6 (mapcar (lambda (x) (float x 1d0)) (nreverse floats)))
             (7 (nreverse ints)) (8 (nreverse strings))
             (t (cond (f (float f 1d0)) (i i) (s s) (tens tens)
+                     (sub sub)
                      (floats (mapcar (lambda (x) (float x 1d0)) (nreverse floats)))
                      (ints (nreverse ints)) (strings (nreverse strings)) (t 0)))))))
+
+(defun %read-subgraph (b)
+  "A GraphProto nested in an attribute.  It declares no inputs — an ONNX subgraph of this form
+reads what it did not compute out of the enclosing scope, by name — so only nodes, initializers and
+outputs matter."
+  (let ((nodes '()) (inits (make-hash-table :test #'equal)) (outs '()))
+    (do-fields (f w b)
+      (1 (push (%read-node (pb-sub b)) nodes))
+      (5 (multiple-value-bind (name tensor) (%read-tensor (pb-sub b))
+           (setf (gethash name inits) tensor)))
+      (12 (push (first (%read-value-info (pb-sub b))) outs)))
+    (%make-subgraph (coerce (nreverse nodes) 'simple-vector) (nreverse outs) inits)))
 
 (defun %read-node (b)
   (let ((ins '()) (outs '()) (name "") (op "") (attrs '()))
@@ -303,6 +318,35 @@ weight of the same name is dropped from the input list — those are constants, 
         (dotimes (b w) (vector-push-extend (ldb (byte 8 (* 8 b)) bits) out))))
     (cons offset (- (fill-pointer out) offset))))
 
+(defun %emit-node (node blob)
+  "One node as the .graph form, appending any tensor or subgraph it carries to BLOB."
+  (format nil "(~s ~s (~{~s~^ ~}) (~{~s~^ ~}) (~{~a~^ ~}))"
+          (node-op node) (node-name node)
+          (coerce (node-inputs node) 'list) (coerce (node-outputs node) 'list)
+          (loop for (aname kind value) in (node-attrs node)
+                collect (case kind
+                          (:graph (format nil "(~s :graph ~a)" aname (%emit-subgraph value blob)))
+                          (:tensor (let ((where (%emit-tensor value blob)))
+                                     (format nil "(~s :tensor (~s ~s ~s ~a ~a))" aname aname
+                                             (%dtype-name (tensor-dtype value))
+                                             (coerce (tensor-shape value) 'list)
+                                             (car where) (cdr where))))
+                          (t (format nil "(~s ~s ~s)" aname kind value))))))
+
+(defun %emit-subgraph (sub blob)
+  "A nested graph, in the shape DECODE-SUBGRAPH destructures: (:initializers .. :nodes .. :outputs ..)."
+  (let ((inits '()))
+    (maphash (lambda (name tensor)
+               (let ((where (%emit-tensor tensor blob)))
+                 (push (format nil "(~s ~s ~s ~a ~a)" name (%dtype-name (tensor-dtype tensor))
+                               (coerce (tensor-shape tensor) 'list) (car where) (cdr where))
+                       inits)))
+             (subgraph-initializers sub))
+    (format nil "(:initializers (~{~a~^ ~}) :nodes (~{~a~^ ~}) :outputs (~{~s~^ ~}))"
+            (nreverse inits)
+            (map 'list (lambda (n) (%emit-node n blob)) (subgraph-nodes sub))
+            (subgraph-outputs sub))))
+
 (defun onnx->graph (onnx-path out-dir)
   "Convert ONNX-PATH into the .graph + .bin pair mill loads, writing both into OUT-DIR.
 Returns the graph path.  This is tools/export-onnx.py, in Lisp and without the dependency."
@@ -333,32 +377,33 @@ Returns the graph path.  This is tools/export-onnx.py, in Lisp and without the d
       (flet ((io (specs)
                (format nil "(~{~a~^~%           ~})"
                        (loop for (name dt shape) in specs
-                             collect (format nil "(~s ~s ~a)" name (%dtype-name dt)
+                             ;; ~s, not ~a: a dynamic dimension is a STRING ("N", "batch_size")
+                             ;; and ~a prints it bare, so it reads back as a SYMBOL and every
+                             ;; shape computation downstream gets a symbol where it wants a name.
+                             collect (format nil "(~s ~s ~s)" name (%dtype-name dt)
                                              (coerce shape 'list))))))
         (format o " :inputs ~a~% :outputs ~a~%" (io (model-inputs model)) (io (model-outputs model))))
       (format o " :initializers (~%~{  ~a~%~})~%"
               (loop for (name dt shape off n) in (nreverse inits)
-                    collect (format nil "(~s ~s ~a ~a ~a)" name dt shape off n)))
+                    collect (format nil "(~s ~s ~s ~a ~a)" name dt shape off n)))
       (format o " :nodes (~%")
       (loop for node across (model-nodes model)
-            do (format o "  (~s ~s (~{~s~^ ~}) (~{~s~^ ~}) (~{~a~^ ~}))~%"
-                       (node-op node) (node-name node)
-                       (coerce (node-inputs node) 'list) (coerce (node-outputs node) 'list)
-                       (loop for (aname kind value) in (node-attrs node)
-                             collect (if (eq kind :tensor)
-                                         (let ((where (%emit-tensor value blob)))
-                                           (format nil "(~s :tensor (~s ~s ~a ~a ~a))" aname aname
-                                                   (%dtype-name (tensor-dtype value))
-                                                   (coerce (tensor-shape value) 'list)
-                                                   (car where) (cdr where)))
-                                         (format nil "(~s ~s ~a)" aname kind
-                                                 (typecase value
-                                                   (string (format nil "~s" value))
-                                                   (list (format nil "~a" value))
-                                                   (t value)))))))
+            do (format o "  ~a~%" (%emit-node node blob)))
       (format o " ))~%"))
-    ;; tensor-valued attributes may have appended to the blob after it was written; rewrite it
     (with-open-file (o bin-path :direction :output :element-type '(unsigned-byte 8)
                                 :if-exists :supersede)
       (write-sequence blob o))
+    ;; A voice's JSON travels with it — the phoneme id map, the sample rate, the inference
+    ;; defaults — and the .graph loader looks for it under <stem>.config.json.  Copying it here
+    ;; is what makes the converted directory complete rather than nearly complete.
+    (let ((src (dolist (c (list (concatenate 'string (namestring onnx-path) ".json")
+                                (namestring (make-pathname :type "json" :defaults onnx-path))))
+                 (when (probe-file c) (return c)))))
+      (when src
+        (with-open-file (in src :element-type '(unsigned-byte 8))
+          (with-open-file (out (merge-pathnames (concatenate 'string stem ".config.json") out-dir)
+                               :direction :output :element-type '(unsigned-byte 8)
+                               :if-exists :supersede :if-does-not-exist :create)
+            (let ((buf (make-array (file-length in) :element-type '(unsigned-byte 8))))
+              (read-sequence buf in) (write-sequence buf out))))))
     (namestring graph-path)))
