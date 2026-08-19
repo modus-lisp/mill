@@ -17,12 +17,15 @@
                              (:file "simd")
                              (:file "parallel")
                              (:file "model")
+                             (:file "onnx")
+                             (:file "profile")
                              (:file "graph")
                              (:file "ops-shape")
                              (:file "ops-math")
                              (:file "ops-reduce")
                              (:file "ops-index")
                              (:file "ops-nn")
+                             (:file "ops-seq")
                              (:file "ops-control")))))
 
 ;;; A .npy reader, so a gate can compare against values numpy wrote.  Its own

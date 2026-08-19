@@ -54,7 +54,14 @@ def lisp_atom(x):
             return "inf"
         if x == float("-inf"):
             return "-inf"
-        return repr(float(x)) + "d0"
+        # A float whose repr already carries an exponent must use Lisp's DOUBLE marker
+        # instead of gaining a second one: "9.99e-06" + "d0" is not a number to the Lisp
+        # reader, it is a SYMBOL, and it fails much later as a type error inside whichever
+        # op read the attribute.  Epsilons are exactly the values that repr this way.
+        r = repr(float(x))
+        if "e" in r or "E" in r:
+            return r.replace("E", "d").replace("e", "d")
+        return r + "d0"
     return str(x)
 
 
