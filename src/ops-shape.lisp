@@ -269,26 +269,43 @@ hundreds of kilobytes."
 
 ;;; ---- filling and padding ---------------------------------------------------
 
+(defvar *constant-values*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Constant node -> the tensor it hands out, which is the same one every time.
+Weak on the node, so a model that is dropped takes its constants with it.")
+
 (defop "Constant" (node ins)
-  ;; A node with no inputs that hands back an attribute.  The result is a COPY:
-  ;; the attribute belongs to the model and outlives the run, while the value
-  ;; bound here is an ordinary intermediate the runner may hand to the tensor
-  ;; pool the moment its last reader is done — which would quietly rewrite the
-  ;; constant under a second run of the same model.
-  (let ((tensor (node-attr node "value")))
-    (cond (tensor (copy-tensor tensor))
-          ((node-attr node "value_int")
-           (tensor-from-list :i64 #() (list (node-attr node "value_int"))))
-          ((node-attr node "value_ints")
-           (let ((xs (node-attr node "value_ints")))
-             (tensor-from-list :i64 (vector (length xs)) xs)))
-          ((node-attr node "value_float")
-           (tensor-from-list :f32 #() (list (node-attr node "value_float"))))
-          ((node-attr node "value_floats")
-           (let ((xs (node-attr node "value_floats")))
-             (tensor-from-list :f32 (vector (length xs)) xs)))
-          (t (error "Constant ~a has no value attribute this understands (~{~a~^, ~})"
-                    (node-name node) (mapcar #'first (node-attrs node)))))))
+  ;; A node with no inputs that hands back an attribute.  It used to hand back a
+  ;; COPY, because the attribute belongs to the model and outlives the run, while
+  ;; the value bound here is an ordinary intermediate the runner may hand to the
+  ;; tensor pool the moment its last reader is done — which would quietly rewrite
+  ;; the constant under a second run of the same model.
+  ;;
+  ;; The copy is gone, and what replaced it is saying so once rather than copying
+  ;; forever: NOTE-CONSTANT puts the vector in the set POOL-RELEASE refuses, so
+  ;; the runner may bind it and drop it and will never hand it to anybody else.
+  ;; The streaming Zipformer has 3330 Constant nodes and asks each of them for
+  ;; its value once per chunk — 213,336 copies an utterance, 4.2% of the run, to
+  ;; produce numbers that were already sitting in memory.  A Constant is an
+  ;; initializer written as a node, and this is what makes it behave like one.
+  (or (gethash node *constant-values*)
+      (setf (gethash node *constant-values*)
+            (note-constant
+             (let ((tensor (node-attr node "value")))
+               (cond (tensor tensor)
+                     ((node-attr node "value_int")
+                      (tensor-from-list :i64 #() (list (node-attr node "value_int"))))
+                     ((node-attr node "value_ints")
+                      (let ((xs (node-attr node "value_ints")))
+                        (tensor-from-list :i64 (vector (length xs)) xs)))
+                     ((node-attr node "value_float")
+                      (tensor-from-list :f32 #() (list (node-attr node "value_float"))))
+                     ((node-attr node "value_floats")
+                      (let ((xs (node-attr node "value_floats")))
+                        (tensor-from-list :f32 (vector (length xs)) xs)))
+                     (t (error "Constant ~a has no value attribute this understands (~{~a~^, ~})"
+                               (node-name node)
+                               (mapcar #'first (node-attrs node))))))))))
 
 (defop "Tile" (node ins)
   (destructuring-bind (a repeats) ins
@@ -333,12 +350,42 @@ hundreds of kilobytes."
            (out (make-tensor (tensor-dtype a) out-shape))
            (ostrides (row-major-strides out-shape))
            (fill-value (if (and value (plusp (tensor-size value))) (tensor-scalar value) nil)))
-      (unless (string= mode "constant")
-        (error "Pad mode ~s is not implemented (this graph only uses constant)" mode))
+      (unless (member mode '("constant" "reflect" "edge") :test #'string=)
+        (error "Pad mode ~s is not implemented" mode))
       ;; Negative pads mean "crop", which ONNX allows and this graph does not use;
       ;; refusing is better than silently producing a plausible wrong tensor.
       (when (some #'minusp pads)
         (error "Pad with negative pads (cropping) is not implemented"))
+      ;; REFLECT and EDGE read from the input for the padded region too, so rather than
+      ;; scattering the interior and filling the rest, walk the OUTPUT and map each index
+      ;; back.  A vocoder pads reflectively before every convolution; constant padding
+      ;; there puts a step discontinuity at both ends of the window, which is audible as a
+      ;; click per frame rather than as a wrong number.
+      (unless (string= mode "constant")
+        (let ((istrides (row-major-strides shape))
+              (idx (make-array (max 1 rank) :element-type 'fixnum)))
+          (with-two-typed-data (da a) (dr out)
+            (dotimes (o (length dr))
+              (let ((rem o) (off 0) (ok t))
+                (dotimes (k rank)
+                  (setf (aref idx k) (floor rem (aref ostrides k))
+                        rem (mod rem (aref ostrides k))))
+                (dotimes (k rank)
+                  (let* ((n (aref shape k))
+                         (p (- (aref idx k) (nth k begin))))
+                    (cond ((< n 1) (setf ok nil))
+                          ((string= mode "edge") (setf p (max 0 (min (1- n) p))))
+                          (t ;; reflect WITHOUT repeating the edge sample: ONNX's "reflect"
+                             ;; is numpy's, so index -1 reads sample 1, not sample 0
+                           (when (> n 1)
+                             (let ((period (* 2 (- n 1))))
+                               (setf p (mod p period))
+                               (when (minusp p) (incf p period))
+                               (when (>= p n) (setf p (- period p)))))
+                           (setf p (max 0 (min (1- n) p)))))
+                    (incf off (* p (aref istrides k)))))
+                (when ok (setf (aref dr o) (aref da off))))))
+          (return-from op-pad out)))
       (with-two-typed-data (da a) (dr out)
         (when (and fill-value (not (eql fill-value (dtype-zero (tensor-dtype a)))))
           (dotimes (i (length dr)) (setf (aref dr i) fill-value)))

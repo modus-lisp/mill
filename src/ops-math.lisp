@@ -508,6 +508,15 @@ output is the input's shape, so the core is always the flat one."
 (def-unop "Softplus" (x) :form (float (softplus-d x) x) :grain +heavy-grain+)
 (def-unop "Not" (x) :form (if (zerop x) 1 0) :int-form (if (zerop x) 1 0) :dtypes (:bool))
 
+;;; Trigonometry.  Kokoro's duration predictor builds its positional encoding out of
+;;; Sin and Cos, and ROUND appears once, turning predicted durations into frame counts.
+;;; ONNX rounds halves to EVEN, which is exactly what CL's FROUND does — the naive
+;;; "add a half and truncate" would bias every .5 upward and drift the alignment.
+(def-unop "Sin" (x) :form (sin x) :grain +heavy-grain+)
+(def-unop "Cos" (x) :form (cos x) :grain +heavy-grain+)
+(def-unop "Atan" (x) :form (atan x) :grain +heavy-grain+)
+(def-unop "Round" (x) :form (fround x))
+
 ;;; LeakyRelu is not a DEF-UNOP because its slope is a node attribute rather than
 ;;; a constant of the op.  It gets the same treatment by hand: 16 nodes, but they
 ;;; are the decoder's, so it moves 22.9 M elements — more than everything else in
