@@ -29,4 +29,6 @@ jobs:
                --eval '(ql-util:without-prompting (ql:add-to-init-file))'
           sbcl --non-interactive --eval '(ql:quickload (list :asdf))'
       - name: Gate
+        env:
+          CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") (:exclude "vendor") (:exclude "deps") :inherit-configuration)'
         run: sbcl --dynamic-space-size 3072 --non-interactive --eval '(require :asdf)' --load inspect/conv-gate.lisp
