@@ -25,10 +25,9 @@
          (outer (floor (tensor-size x) (max 1 inner)))
          (res (make-tensor (tensor-dtype x) (tensor-shape x))))
     (when (zerop inner) (error "LayerNormalization: empty normalization axis"))
-    (with-typed-data (dx x :dtypes (:f32 :f64))
+    (with-two-typed-data (dx x) (dr res :dtypes (:f32 :f64))
       (with-typed-data (ds scale :dtypes (:f32 :f64))
-        (with-typed-data (dr res :dtypes (:f32 :f64))
-          (let ((db (and bias (tensor-data bias))))
+        (let ((db (and bias (tensor-data bias))))
             (dotimes (o outer)
               (let ((base (* o inner)) (mean 0d0) (var 0d0))
                 (loop for i below inner do (incf mean (aref dx (+ base i))))
@@ -41,8 +40,8 @@
                         do (setf (aref dr (+ base i))
                                  (coerce (+ (* (- (aref dx (+ base i)) mean) inv (aref ds i))
                                             (if db (aref db i) 0d0))
-                                         (array-element-type dr)))))))))))
-    res))
+                                         (array-element-type dr)))))))))
+    res)))
 
 ;;; ---- Resize ------------------------------------------------------------------
 ;;; Scales-driven only, which is what an upsampling decoder emits; a SIZES-driven Resize would be
@@ -77,8 +76,7 @@
         (setf (aref scales i) (float (aref sd i) 1d0)
               (aref out-shape i) (max 1 (floor (* (tensor-dim x i) (aref scales i))))))
       (let ((res (make-tensor (tensor-dtype x) out-shape)))
-        (with-typed-data (dx x :dtypes (:f32 :f64))
-          (with-typed-data (dr res :dtypes (:f32 :f64))
+        (with-two-typed-data (dx x) (dr res :dtypes (:f32 :f64))
             ;; row-major strides for both sides, computed once
             (let ((istride (make-array rank :element-type 'fixnum))
                   (ostride (make-array rank :element-type 'fixnum))
@@ -125,7 +123,7 @@
                                     (incf bit))
                                   (incf off (* (aref idx i) (aref istride i)))))
                             (unless (zerop w) (incf acc (* w (aref dx off))))))
-                        (setf (aref dr o) (coerce acc (array-element-type dr))))))))))
+                        (setf (aref dr o) (coerce acc (array-element-type dr)))))))))
         res))))
 
 ;;; ---- LSTM --------------------------------------------------------------------

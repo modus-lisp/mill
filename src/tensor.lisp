@@ -209,16 +209,32 @@ the graph rather than reading a nice diagnosable zero."
                                  (declare (ignorable ,var))
                                  ,@body)))))))
 
-(defmacro with-two-typed-data ((va ta) (vb tb) &body body)
+(defmacro with-two-typed-data ((va ta) (vb tb &key (dtypes '(:f32 :f64 :i64 :i32 :bool)))
+                              &body body)
   "Like WITH-TYPED-DATA over two tensors that share a dtype.  Mixed dtypes are a
 bug in the caller — ONNX ops that combine types say so explicitly (Cast, Where) —
-so this refuses rather than coercing quietly."
+so this refuses rather than coercing quietly.
+
+DTYPES narrows which branches are compiled, exactly as in WITH-TYPED-DATA, and
+matters for more than code size.  NESTING two WITH-TYPED-DATA forms over a pair
+compiles every CROSS combination — for {:f32,:f64} that is four branches, two of
+which write a DOUBLE-FLOAT into a SINGLE-FLOAT array.  Those branches cannot run,
+because every caller builds its output with (MAKE-TENSOR (TENSOR-DTYPE input) ...),
+but they are compiled all the same, and a compiler is entitled to complain about
+code it can see is wrong.  SBCL 2.2.9 does, with a full WARNING that ASDF turns
+fatal; 2.5.6 derives the types differently and only prints a note.  Same source,
+different verdict, and the older one is right.
+
+Stating the invariant here rather than implying it through nesting removes those
+branches from existence, and keeps the check that the tensors really do agree —
+without it, the THE declarations would be a lie and a mismatch would be silent
+arithmetic on the wrong element type instead of an error."
   (let ((tan (gensym)) (tbn (gensym)))
     `(let ((,tan ,ta) (,tbn ,tb))
        (unless (eq (tensor-dtype ,tan) (tensor-dtype ,tbn))
          (error "tensor dtypes differ: ~a vs ~a" (tensor-dtype ,tan) (tensor-dtype ,tbn)))
        (ecase (tensor-dtype ,tan)
-         ,@(loop for dt in '(:f32 :f64 :i64 :i32 :bool)
+         ,@(loop for dt in dtypes
                  collect `(,dt (let ((,va (the (simple-array ,(dtype-element-type dt) (*))
                                                (tensor-data ,tan)))
                                      (,vb (the (simple-array ,(dtype-element-type dt) (*))
