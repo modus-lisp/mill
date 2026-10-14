@@ -65,7 +65,13 @@ The sleep is still there underneath, and it is what makes this safe to leave on:
 a pool with nothing to do stops burning cores after one spin budget, so an idle
 process is idle.  Set it to 0 to go back to sleeping immediately.")
 
-#+sb-thread
+;;; NOT ON MODUS.  The pool is shared memory by design -- workers read *JOB* and
+;;; write straight into the caller's tensors -- and modus threads share nothing:
+;;; a worker's stores into the caller's objects are refused or, for raw lanes,
+;;; land where the caller's collector no longer keeps the object.  modus has
+;;; SB-THREAD (its shim), so the feature alone would pick this arm; it gets the
+;;; one-thread arm below until mill has a message-passing pool.
+#+(and sb-thread (not modus))
 (progn
 
 ;;; A job is announced by bumping SEQ and finished by copying it into ACK, so
@@ -235,9 +241,9 @@ one-chunk split is just a call, and small work never touches the pool."
       ;; NIL is reserved for "the lock was not free", which WITH-MUTEX returns for us.
       t)))
 
-) ; #+sb-thread
+) ; #+(and sb-thread (not modus))
 
-#-sb-thread
+#-(and sb-thread (not modus))
 (progn
   (defun shutdown-workers () (values))
   (defun parallel-range (n fn &key (min-chunk 1))

@@ -27,6 +27,13 @@
 (asdf:load-system :mill)
 (in-package #:mill)
 
+;;; modus has no pool (src/parallel.lisp: its threads share nothing, and the pool is shared
+;;; memory), and this gate's dispatcher threads share their results the same way -- there is
+;;; nothing here to test there.
+#+modus
+(progn (format t "~&pool gate: not applicable on modus (no worker pool; threads share no state)~%")
+       (finish-output) (sb-ext:exit :code 0))
+
 (defparameter *threads* 6 "Concurrent dispatchers — more than the pool has workers.")
 (defparameter *rounds* 40)
 (defparameter *n* 20000)
