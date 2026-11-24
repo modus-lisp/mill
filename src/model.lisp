@@ -67,7 +67,9 @@ strings; the caller is the one who knows it wanted a number."
           (ash (aref bytes (+ at 3)) 24)))
 
 (defun decode-tensor (dtype shape bytes offset)
-  (let* ((tn (make-tensor dtype shape))
+  ;; the model's own data (MAKE-MODEL-DATA): never the pool's, and on modus outside the moving heap
+  (let* ((shape (coerce shape 'simple-vector))
+         (tn (%make-tensor dtype shape (make-model-data dtype (shape-size shape))))
          (n (tensor-size tn))
          (data (tensor-data tn)))
     (declare (type (simple-array (unsigned-byte 8) (*)) bytes))

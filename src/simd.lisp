@@ -112,7 +112,27 @@ difference is a transition penalty per iteration."
   (defmacro f32v/ (a b) `(sb-simd-avx2:f32.8/ ,a ,b))
   (defmacro f32v-done () `(sb-simd-avx2:vzeroupper)))
 
-#-mill-avx2
+;;; Modus: NEON (and SSE on x86-64), as modus's own f32x4 primitives, one
+;;; instruction each.  A vector is a 4-lane (simple-array single-float (4)), and
+;;; a variable declared that way stays in a vector register while its scope is
+;;; call-free, which every kernel's inner loop is.  The array an access names has
+;;; to be a declared variable, not a form, for the same reason.
+
+#+(and modus (not mill-avx2))
+(progn
+  (defconstant +f32-lanes+ 4)
+  (deftype f32v-pack () '(simple-array single-float (4)))
+
+  (defmacro f32v-ref (a i) `(modus-int::%f32v-ref ,a ,i))
+  (defmacro f32v-broadcast (x) `(modus-int::%f32v-broadcast ,x))
+  (defmacro f32v-broadcast-ref (a i) `(modus-int::%f32v-broadcast-ref ,a ,i))
+  (defmacro f32v+ (a b) `(modus-int::%f32v+ ,a ,b))
+  (defmacro f32v- (a b) `(modus-int::%f32v- ,a ,b))
+  (defmacro f32v* (a b) `(modus-int::%f32v* ,a ,b))
+  (defmacro f32v/ (a b) `(modus-int::%f32v/ ,a ,b))
+  (defmacro f32v-done () nil))
+
+#-(or mill-avx2 modus)
 (progn
   (defconstant +f32-lanes+ 1)
   (deftype f32v-pack () 'single-float)

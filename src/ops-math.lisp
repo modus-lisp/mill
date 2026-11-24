@@ -365,15 +365,17 @@ negative bases all follow from that being a single rounding either way."
 ;;; ---- unary -----------------------------------------------------------------
 
 (defmacro def-unop (name (x) &key form int-form f32-form (dtypes '(:f32 :f64))
-                                  (grain '+flat-grain+))
+                                  (grain '+flat-grain+) core)
   "Define an elementwise unary op.  Same shape as DEF-BINOP — including the
 float32 fast road, which for a unary op needs no broadcast analysis at all: the
 output is the input's shape, so the core is always the flat one."
+  ;; CORE names an f32 core defined elsewhere (DA DR LO HI), used instead of the one made from F32-FORM
   (let* ((fastp (member :f32 dtypes))
-         (core (intern (format nil "~:@(~a~)-CORE-F32" name)))
+         (own-core (null core))
+         (core (or core (intern (format nil "~:@(~a~)-CORE-F32" name))))
          (f32-body (or f32-form form)))
     `(progn
-       ,@(when fastp
+       ,@(when (and fastp own-core)
            `((defun ,core (da dr lo hi)
                (declare (type f32v da dr) (type dim lo hi)
                         (optimize (speed 3) (safety 0)))
@@ -496,7 +498,88 @@ output is the input's shape, so the core is always the flat one."
 (def-unop "Sqrt" (x) :form (if (minusp x) (/ (- x x) (- x x)) (sqrt x))
                      :grain +heavy-grain+)
 (def-unop "Exp" (x) :form (exp x) :grain +heavy-grain+)
+;;; LOG ON MODUS.  modus's LOG works in boxed doubles through the generic arithmetic -- 815 ns an element on
+;;; an M-series core, against 5 for its inlined EXP -- and the Zipformer takes the log of every activation it
+;;; normalizes: a third of a transcription.  So on modus the f32 core does it itself: the exponent off the IEEE
+;;; bits (%F32-BITS-REF), the mantissa rebuilt as a float in [1, 2) through the output slot and brought into
+;;; [sqrt 1/2, sqrt 2), then fdlibm's __ieee754_log in double-float -- f = m - 1, s = f/(2+f), the Lg1..Lg7
+;;; polynomial in s^2, k ln2 split hi/lo -- rounded once to single.  That is SBCL's arithmetic too (a double log,
+;;; rounded): the two can differ only where the double result lies within its own error of a single's rounding
+;;; boundary.  Zero, negatives, subnormals, infinities and NaNs take LOG as before.
+
+#+modus
+(progn
+
+  ;; ONE CALL-FREE SCOPE, FIVE DOUBLES.  modus keeps doubles in FP registers only in a scope with no call in it
+  ;; and only as many as fit (six); a helper function made every value a boxed double crossing a call, and the
+  ;; conversions generic ones.  So the element's whole computation is here, in five variables reused by SETQ,
+  ;; each step fdlibm's operation in fdlibm's order:
+  ;;   f = m - 1, s = f/(2+f), z = s^2, w = z^2,
+  ;;   t2 = z(Lg1 + w(Lg3 + w(Lg5 + w Lg7))), t1 = w(Lg2 + w(Lg4 + w Lg6)), R = t2 + t1,
+  ;;   hfsq = f^2/2, log = k ln2_hi - ((hfsq - (s(hfsq + R) + k ln2_lo)) - f).
+  ;; K AS A DOUBLE, WITHOUT CONVERTING AN INTEGER: modus compiles a fixnum-to-double conversion as a call, and a
+  ;; call anywhere in the scope boxes every double in it.  A single read from a single-float array and widened is
+  ;; done in registers, and every exponent a single can have (-126 .. 128) is exact as a single.
+  (defparameter *log-exponents*
+    (let ((v (make-array 256 :element-type 'single-float)))
+      (dotimes (j 256 v) (setf (aref v j) (float (- j 127) 1f0)))))
+
+  (defun %log-core-f32-modus (da dr lo hi)
+    (declare (type f32v da dr) (type dim lo hi) (optimize (speed 3) (safety 0)))
+    (let ((kt *log-exponents*))
+     (declare (type f32v kt))
+     (loop for i of-type dim from lo below hi
+          do (let ((bits (modus-int::%f32-bits-ref da i)))
+               (declare (type (unsigned-byte 32) bits))
+               (if (and (>= bits #x00800000) (< bits #x7F800000))
+                   (let ((k (- (ash bits -23) 127)))
+                    (declare (type fixnum k))
+                    ;; the mantissa as a float in [1, 2), through the output slot -- out here: a bit store in the
+                    ;; scope below would box its doubles
+                    (modus-int::%f32-bits-set dr i (logior (logand bits #x7FFFFF) #x3F800000))
+                    (let ((vf 0d0) (vs 0d0) (vz 0d0) (vw 0d0) (vt 0d0))
+                     (declare (type double-float vf vs vz vw vt))
+                     (setq vf (float (aref dr i) 1d0))
+                     (when (> vf 1.4142135623730951d0)           ; two SETQs: a multi-pair one boxes every double here
+                       (setq vf (* vf 0.5d0))
+                       (setq k (+ k 1)))
+                     (setq vf (- vf 1d0))                               ; f
+                     (setq vs (/ vf (+ 2d0 vf)))                        ; s
+                     (setq vz (* vs vs))                                ; z
+                     (setq vw (* vz vz))                                ; w
+                     (setq vt (* vw 1.479819860511658591d-01))          ; t2
+                     (setq vt (+ 1.818357216161805012d-01 vt))
+                     (setq vt (* vw vt))
+                     (setq vt (+ 2.857142874366239149d-01 vt))
+                     (setq vt (* vw vt))
+                     (setq vt (+ 6.666666666666735130d-01 vt))
+                     (setq vt (* vz vt))
+                     (setq vz (* vw 1.531383769920937332d-01))          ; t1, in z (z is done)
+                     (setq vz (+ 2.222219843214978396d-01 vz))
+                     (setq vz (* vw vz))
+                     (setq vz (+ 3.999999999940941908d-01 vz))
+                     (setq vz (* vw vz))
+                     (setq vt (+ vt vz))                                ; R = t2 + t1
+                     (setq vw (* vf vf))                                ; hfsq, in w (w is done)
+                     (setq vw (* 0.5d0 vw))
+                     (setq vz (+ vw vt))                                ; s (hfsq + R)
+                     (setq vz (* vs vz))
+                     (setq vt (float (aref kt (+ k 127)) 1d0))          ; + k ln2_lo
+                     (setq vt (* vt 1.90821492927058770002d-10))
+                     (setq vz (+ vz vt))
+                     (setq vz (- vw vz))                                ; hfsq - (...)
+                     (setq vz (- vz vf))                                ; ... - f
+                     (setq vt (float (aref kt (+ k 127)) 1d0))          ; k ln2_hi - that
+                     (setq vt (* vt 6.93147180369123816490d-01))
+                     (setq vt (- vt vz))
+                     (setf (aref dr i) (float vt 1f0))))
+                   (setf (aref dr i) (log (aref da i)))))))
+    (values)))
+
+#-modus
 (def-unop "Log" (x) :form (log x) :grain +heavy-grain+)
+#+modus
+(def-unop "Log" (x) :form (log x) :grain +heavy-grain+ :core %log-core-f32-modus)
 (def-unop "Ceil" (x) :form (fceiling x))
 (def-unop "Floor" (x) :form (ffloor x))
 (def-unop "Tanh" (x) :form (tanh x) :grain +heavy-grain+)

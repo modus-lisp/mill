@@ -107,11 +107,12 @@ register per lane group and saves a re-read of B; four is where the accumulators
 still fit alongside the operands, and it is exactly the row count of this
 model's largest MatMul.")
 
-(defconstant +mm-lanes+ 3
+(defconstant +mm-lanes+ #-modus 3 #+modus 2
   "Lane groups of columns held in registers at once.  R rows by C lane groups
 costs R*C accumulators plus C values of B plus one multiplier, and sixteen is
 all there is: 4x3 measured 75 us on the dominant shape, 4x2 84, 4x1 108, and 4x4
-164 because it spills.")
+164 because it spills.  modus keeps twelve vector values in registers, not
+sixteen, and a block that does not fit is not spilled there but boxed, so 4x2.")
 
 (defconstant +mm-cols+ (* +mm-lanes+ +f32-lanes+)
   "Columns in a wide block, and the alignment of every column window a caller
@@ -143,7 +144,7 @@ order, so the run for a group starting at column COL begins at COL*K — which i
 why the kernel needs no table to find it."
   (declare (type (simple-array single-float (*)) db) (type dim k n)
            (optimize (speed 3) (safety 0)))
-  (let ((p (make-array (* k n) :element-type 'single-float))
+  (let ((p (the (simple-array single-float (*)) (make-model-data :f32 (* k n))))   ; a weight's: static on modus
         (o 0) (col 0))
     (declare (type dim o col))
     (flet ((group (w)
@@ -873,6 +874,15 @@ row — one line in 1-D, a whole image in 2-D."
         (error "Conv: input has ~d channels but the weights want ~d x ~d"
                cin group cgroup))
       (when db (fill-conv-bias dr db batch cout out-len))
+      ;; DEPTHWISE, stride 1: DEPTHWISE-CORE with one row (the Zipformer's convolution modules, 31 taps wide --
+      ;; past CONV-FUSED's unrolled widths, so one element and one tap at a time there)
+      (when (and (= group cin cout) (= cgroup 1) (= stride dilation 1))
+        (multiple-value-bind (ilo ihi) (fused-window out-len len kw 1 pad-begin 1)
+          (parallel-range (* batch cout)
+                          (lambda (lo hi)
+                            (depthwise-core dx dw dr lo hi cout 1 len 1 kw 1 out-len 0 pad-begin ilo ihi))
+                          :min-chunk (max 1 (ceiling +parallel-grain+ (max 1 (* kw out-len))))))
+        (return-from conv1d res))
       ;; a row costs CGROUP * KW multiply-adds per output tap; hand a thread
       ;; work worth having, not a row that finishes before it wakes up
       (parallel-range (* batch cout)
@@ -882,6 +892,209 @@ row — one line in 1-D, a whole image in 2-D."
                       :min-chunk (max 1 (ceiling +parallel-grain+
                                                  (max 1 (* cgroup kw out-len)))))
       res)))
+
+;;; A POINTWISE CONVOLUTION IS A MATRIX PRODUCT -- output channels by input channels, times input channels by
+;;; the plane -- and gets MATMUL's register blocks: R output channels by +MM-LANES+ lane groups of the plane in
+;;; accumulators, an input channel's row of the plane loaded once per pass and each weight broadcast across it.
+;;; Not MATMUL itself, because the sum has to stay the convolution's: each accumulator STARTS AT THE BIAS (the
+;;; value FILL-CONV-BIAS put there) and takes the channels in increasing order, product rounded before the add --
+;;; the sequence CONV-FUSED's kernel-1 path performs element by element.  So the floats do not move.
+
+(defmacro %pw-block (r c)
+  "Blocks of C lane groups of the plane for R output channels, from COL while they fit.  Free: DX DW DR XBASE
+CIN PLANE COL and the WROWi / OROWi the caller bound."
+  (let ((accs (loop for i below r collect (loop for j below c collect (intern (format nil "PACC~d~d" i j)))))
+        (bs (loop for j below c collect (intern (format nil "PBV~d" j))))
+        (ws (loop for i below r collect (intern (format nil "WROW~d" i))))
+        (os (loop for i below r collect (intern (format nil "OROW~d" i)))))
+    `(loop while (<= (+ col ,(* c +f32-lanes+)) plane) do
+       (let (,@(loop for i below r append
+                     (loop for j below c for a = (nth j (nth i accs))
+                           collect `(,a (f32v-ref dr (the dim (+ ,(nth i os) col ,(* j +f32-lanes+))))))))
+         (declare (type f32v-pack ,@(reduce #'append accs)))
+         (dotimes (ch cin)
+           (declare (type dim ch))
+           (let ((xrow (the dim (+ xbase (the dim (* ch plane)) col))))
+             (declare (type dim xrow))
+             (let (,@(loop for b in bs for j from 0
+                           collect `(,b (f32v-ref dx (the dim (+ xrow ,(* j +f32-lanes+)))))))
+               (declare (type f32v-pack ,@bs))
+               ,@(loop for i below r
+                       collect `(let ((wv (f32v-broadcast-ref dw (the dim (+ ,(nth i ws) ch)))))
+                                  (declare (type f32v-pack wv))
+                                  ,@(loop for j below c for a = (nth j (nth i accs))
+                                          collect `(setq ,a (f32v+ ,a (f32v* wv ,(nth j bs))))))))))
+         ,@(loop for i below r append
+                 (loop for j below c
+                       collect `(setf (f32v-ref dr (the dim (+ ,(nth i os) col ,(* j +f32-lanes+))))
+                                      ,(nth j (nth i accs))))))
+       (setq col (+ col ,(* c +f32-lanes+))))))
+
+(defmacro %def-pw-kernel (name r)
+  (let ((ws (loop for i below r collect (intern (format nil "WROW~d" i))))
+        (os (loop for i below r collect (intern (format nil "OROW~d" i)))))
+    `(defun ,name (dx dw dr xbase cin plane ,@ws ,@os)
+       "R output channels of a pointwise convolution over the whole plane, on top of the bias already in DR."
+       (declare (type (simple-array single-float (*)) dx dw dr)
+                (type dim xbase cin plane ,@ws ,@os)
+                (optimize (speed 3) (safety 0)))
+       (let ((col 0))
+         (declare (type dim col))
+         (%pw-block ,r ,+mm-lanes+)
+         (%pw-block ,r 1)
+         (f32v-done)
+         ;; the columns that are not a lane: the same sum, one element at a time
+         (loop while (< col plane) do
+           ,@(loop for i below r
+                   collect `(let ((acc (aref dr (the dim (+ ,(nth i os) col)))))
+                              (declare (type single-float acc))
+                              (dotimes (ch cin)
+                                (declare (type dim ch))
+                                (setq acc (+ acc (* (aref dw (the dim (+ ,(nth i ws) ch)))
+                                                    (aref dx (the dim (+ xbase (the dim (* ch plane)) col)))))))
+                              (setf (aref dr (the dim (+ ,(nth i os) col))) acc)))
+           (setq col (+ col 1))))
+       (values))))
+
+(%def-pw-kernel %pw-rows-1 1) (%def-pw-kernel %pw-rows-2 2)
+(%def-pw-kernel %pw-rows-3 3) (%def-pw-kernel %pw-rows-4 4)
+
+(defun pointwise-core (dx dw dr row-lo row-hi cin cout plane)
+  "Rows [ROW-LO, ROW-HI) -- (batch item, output channel) pairs -- of a group-1 pointwise convolution, four
+output channels of one batch item at a time."
+  (declare (type (simple-array single-float (*)) dx dw dr)
+           (type dim row-lo row-hi cin cout plane))
+  (let ((row row-lo))
+    (declare (type dim row))
+    (loop while (< row row-hi) do
+      (multiple-value-bind (nb m) (floor row cout)
+        (declare (type dim nb m))
+        ;; up to four channels, none past this batch item or the range
+        (let* ((rr (min 4 (- row-hi row) (- cout m)))
+               (xbase (* nb cin plane))
+               (w0 (* m cin)) (o0 (* row plane)))
+          (declare (type dim rr xbase w0 o0))
+          (ecase rr
+            (1 (%pw-rows-1 dx dw dr xbase cin plane w0 o0))
+            (2 (%pw-rows-2 dx dw dr xbase cin plane w0 (+ w0 cin) o0 (+ o0 plane)))
+            (3 (%pw-rows-3 dx dw dr xbase cin plane w0 (+ w0 cin) (+ w0 cin cin)
+                           o0 (+ o0 plane) (+ o0 plane plane)))
+            (4 (%pw-rows-4 dx dw dr xbase cin plane w0 (+ w0 cin) (+ w0 cin cin) (+ w0 cin cin cin)
+                           o0 (+ o0 plane) (+ o0 plane plane) (+ o0 plane plane plane))))
+          (incf row rr)))))
+  (values))
+
+;;; A DEPTHWISE CONVOLUTION (one input channel per output channel), stride 1: four output columns a vector.
+;;; Over the window where every kernel column reads a real sample (FUSED-WINDOW's) each lane's sum is
+;;; CONV-FUSED's -- the value in DR, then for each kernel row in order its taps left to right, product rounded
+;;; before the add -- in one register; the columns at either end, where some taps fall in the padding, go one
+;;; element at a time with CONV1D-TAPS' rules: a tap outside the signal is not added, and neither is a weight of
+;;; exactly zero.  So the floats do not move.
+
+(defun depthwise-core (dx dw dr row-lo row-hi ch ih iw kh kw oh ow pad-h pad-w ilo ihi)
+  "Rows [ROW-LO, ROW-HI) -- (batch item, channel) pairs -- of a stride-1 depthwise convolution."
+  (declare (type (simple-array single-float (*)) dx dw dr)
+           (type dim row-lo row-hi ch ih iw kh kw oh ow ilo ihi)
+           (type (signed-byte 30) pad-h pad-w)
+           (optimize (speed 3) (safety 0)))
+  (loop for row of-type dim from row-lo below row-hi do
+    (let* ((m (mod row ch))
+           (xbase (the dim (* row ih iw)))
+           (obase (the dim (* row oh ow)))
+           (wbase (the dim (* m kh kw))))
+      (declare (type dim m xbase obase wbase))
+      (dotimes (y oh)
+        (declare (type dim y))
+        (let ((orow (the dim (+ obase (the dim (* y ow))))))
+          (declare (type dim orow))
+          ;; the interior, a lane group at a time
+          (let ((ox ilo))
+            (declare (type dim ox))
+            (loop while (<= (+ ox +f32-lanes+) ihi) do
+              (let ((acc (f32v-ref dr (the dim (+ orow ox)))))
+                (declare (type f32v-pack acc))
+                (dotimes (k kh)
+                  (declare (type dim k))
+                  (let ((sy (- (+ y k) pad-h)))
+                    (declare (type fixnum sy))
+                    (when (and (>= sy 0) (< sy ih))
+                      (let ((xrow (the dim (+ xbase (the dim (* sy iw)) (- ox pad-w))))
+                            (wrow (the dim (+ wbase (the dim (* k kw))))))
+                        (declare (type dim xrow wrow))
+                        (dotimes (j kw)
+                          (declare (type dim j))
+                          (setq acc (f32v+ acc (f32v* (f32v-broadcast-ref dw (the dim (+ wrow j)))
+                                                      (f32v-ref dx (the dim (+ xrow j)))))))))))
+                (setf (f32v-ref dr (the dim (+ orow ox))) acc))
+              (setq ox (+ ox +f32-lanes+)))
+            (f32v-done)
+            ;; the rest of the interior: the same sum, one element at a time
+            (loop while (< ox ihi) do
+              (let ((acc (aref dr (the dim (+ orow ox)))))
+                (declare (type single-float acc))
+                (dotimes (k kh)
+                  (declare (type dim k))
+                  (let ((sy (- (+ y k) pad-h)))
+                    (declare (type fixnum sy))
+                    (when (and (>= sy 0) (< sy ih))
+                      (dotimes (j kw)
+                        (declare (type dim j))
+                        (setq acc (+ acc (* (aref dw (the dim (+ wbase (the dim (* k kw)) j)))
+                                            (aref dx (the dim (+ xbase (the dim (* sy iw)) (- (+ ox j) pad-w)))))))))))
+                (setf (aref dr (the dim (+ orow ox))) acc))
+              (setq ox (+ ox 1))))
+          ;; the padded ends: taps outside the signal, and zero weights, are not added (CONV1D-TAPS)
+          (flet ((edge (ox)
+                   (declare (type dim ox))
+                   (let ((acc (aref dr (the dim (+ orow ox)))))
+                     (declare (type single-float acc))
+                     (dotimes (k kh)
+                       (declare (type dim k))
+                       (let ((sy (- (+ y k) pad-h)))
+                         (declare (type fixnum sy))
+                         (when (and (>= sy 0) (< sy ih))
+                           (dotimes (j kw)
+                             (declare (type dim j))
+                             (let ((sx (- (+ ox j) pad-w))
+                                   (wt (aref dw (the dim (+ wbase (the dim (* k kw)) j)))))
+                               (declare (type fixnum sx) (type single-float wt))
+                               (when (and (>= sx 0) (< sx iw) (/= wt 0f0))
+                                 (setq acc (+ acc (* wt (aref dx (the dim (+ xbase (the dim (* sy iw)) sx))))))))))))
+                     (setf (aref dr (the dim (+ orow ox))) acc))))
+            (dotimes (ox ilo) (edge ox))
+            (loop for ox of-type dim from ihi below ow do (edge ox)))))))
+  (values))
+
+;;; A GROUP-1 CONVOLUTION WITH NO PADDING, at any stride or dilation, is a matrix product once its input is laid
+;;; out as columns: row (c, k, j) of the column matrix holds, for every output position, the sample that tap
+;;; reads -- every tap reads a real sample when nothing is padded.  POINTWISE-CORE then sums each output's taps in
+;;; (input channel, kernel row, kernel column) order from the bias up: the order CONV2D-CORE takes them in.  One
+;;; difference it cannot make up: at a stride other than 1 the per-tap path skips a weight of exactly zero, so
+;;; this path is taken only when no weight is zero, and the two then add the same terms.
+
+(defun conv2d-as-product (dx dw dr batch cin ih iw cout kh kw oh ow stride-h stride-w dil-h dil-w)
+  "DR += the convolution, through the column matrix of every batch item (laid out as POINTWISE-CORE reads a
+   K-channel input: batch item NB's rows at NB*K*PLANE)."
+  (let* ((kk (* cin kh kw)) (plane (* oh ow))
+         (cols (make-array (* batch kk plane) :element-type 'single-float)))
+    (declare (type dim kk plane) (type (simple-array single-float (*)) cols))
+    (dotimes (nb batch)
+      (let ((xb (* nb cin ih iw)) (cb (* nb kk plane)))
+        (declare (type dim xb cb))
+        (dotimes (c cin)
+          (dotimes (k kh)
+            (dotimes (j kw)
+              (let ((r (+ cb (* (+ (* (+ (* c kh) k) kw) j) plane))))
+                (declare (type dim r))
+                (dotimes (y oh)
+                  (let ((src (+ xb (* c ih iw) (* (+ (* y stride-h) (* k dil-h)) iw) (* j dil-w)))
+                        (dst (+ r (* y ow))))
+                    (declare (type dim src dst))
+                    (dotimes (x ow)
+                      (setf (aref cols (+ dst x)) (aref dx (+ src (* x stride-w)))))))))))))
+    (parallel-range (* batch cout)
+                    (lambda (lo hi) (pointwise-core cols dw dr lo hi kk cout plane))
+                    :min-chunk (max 1 (ceiling +parallel-grain+ (max 1 (* kk plane)))))))
 
 (defun conv2d (node x w bias)
   (let* ((strides (node-attr node "strides" '(1 1)))
@@ -908,6 +1121,37 @@ row — one line in 1-D, a whole image in 2-D."
       (error "Conv: input has ~d channels but the weights want ~d x ~d"
              cin group cgroup))
     (when db (fill-conv-bias dr db batch cout (* oh ow)))
+    ;; A POINTWISE CONVOLUTION -- 1x1, stride 1, no padding or dilation -- reads each input plane whole and
+    ;; writes each output plane whole: it is the 1-D convolution of kernel 1 over the flattened plane.  The
+    ;; 2-D walk did it a line at a time, one call per (output channel, input channel, line) for lines of a
+    ;; couple of dozen floats; this is one call per (output channel, input channel) over the plane.  Each
+    ;; output still takes its terms in input-channel order after the bias, so the floats do not move.  (The
+    ;; Zipformer's two ConvNeXt pointwise layers: 0.22 s each under SBCL, 38 s each on modus, where a call
+    ;; costs more.)
+    (when (and (= kh kw 1) (= stride-h stride-w dil-h dil-w 1)
+               (every #'zerop pads))
+      (let ((plane (* ih iw)))
+        (parallel-range (* batch cout)
+                        (lambda (lo hi)
+                          (if (= group 1)
+                              ;; the matrix-product kernel (POINTWISE-CORE)
+                              (pointwise-core dx dw dr lo hi cin cout plane)
+                              (conv1d-core dx dw dr lo hi cin plane cout cgroup 1 plane
+                                           1 1 0 per-group-out)))
+                        :min-chunk (max 1 (ceiling +parallel-grain+ (max 1 (* cgroup plane)))))
+        (return-from conv2d res)))
+    ;; depthwise, stride 1 (DEPTHWISE-CORE)
+    (when (and (= group cin cout) (= cgroup 1) (= stride-h stride-w dil-h dil-w 1))
+      (multiple-value-bind (ilo ihi) (fused-window ow iw kw dil-w pad-w stride-w)
+        (parallel-range (* batch cout)
+                        (lambda (lo hi)
+                          (depthwise-core dx dw dr lo hi cout ih iw kh kw oh ow pad-h pad-w ilo ihi))
+                        :min-chunk (max 1 (ceiling +parallel-grain+ (max 1 (* kh kw oh ow))))))
+      (return-from conv2d res))
+    ;; group 1, nothing padded, no zero weight: a matrix product over the input's columns (CONV2D-AS-PRODUCT)
+    (when (and (= group 1) (every #'zerop pads) (notany #'zerop dw))
+      (conv2d-as-product dx dw dr batch cin ih iw cout kh kw oh ow stride-h stride-w dil-h dil-w)
+      (return-from conv2d res))
     (parallel-range (* batch cout)
                     (lambda (lo hi)
                       (conv2d-core dx dw dr lo hi cin ih iw cout cgroup kh kw oh ow

@@ -172,6 +172,22 @@ generic loop over an array of unknown type."
                         (t (make-array n :element-type et
                                          :initial-element value))))))
 
+(defun make-model-data (dtype n)
+  "Zeroed storage for N elements of a tensor the MODEL owns -- an initializer, a Constant's value, a packed
+weight -- as opposed to one a run makes and drops.
+
+ON MODUS A FLOAT32 ONE IS A STATIC VECTOR (MODUS:MAKE-STATIC-VECTOR), outside the moving heap.  A model's
+weights are most of the memory a run holds and live for as long as the model: on the phone they do not fit in
+the heap beside the world at all (the encoder alone is 262 MB), and in it every collection would copy them.
+And the tables keyed on them -- *CONST-DATA*, *MM-PACKS* -- are EQ tables: a vector the collector moves is a
+key that no longer hashes where it was put, so a weight stopped being a constant (MatMul packed it again every
+call, and the pool could take it for scratch).  A vector that never moves keeps its key.  Everywhere else, and
+for the other element types, an ordinary array."
+  #+modus
+  (when (eq dtype :f32)
+    (return-from make-model-data (modus:make-static-vector n :element-type 'single-float)))
+  (make-array n :element-type (dtype-element-type dtype) :initial-element (dtype-zero dtype)))
+
 (defun make-tensor-unfilled (dtype shape)
   "A new tensor of DTYPE whose data has NOT been zeroed.  Only for kernels that
 assign every element of it — anything that accumulates still needs MAKE-TENSOR.
